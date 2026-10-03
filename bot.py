@@ -30,10 +30,27 @@ Threading model (Render Web Service):
         ├── Telegram bot -> daemon background thread (start_bot_thread)
         └── Flask        -> main thread (live.py)
 
-Python 3.10+/3.12 do NOT create an asyncio event loop automatically for
-non-main threads, and Application.run_polling() calls
-asyncio.get_event_loop() internally. _bot_worker() therefore creates and
-installs an event loop for its thread EXPLICITLY before starting the bot.
+IMPORTANT — why Application.run_polling() is NOT used here:
+
+run_polling() is a convenience wrapper designed for the MAIN thread. Besides
+needing an event loop (Python 3.10+/3.12 no longer auto-create one for
+non-main threads), it installs SIGINT/SIGTERM handlers on the loop via
+loop.add_signal_handler(), which asyncio implements with
+signal.set_wakeup_fd() — allowed ONLY in the main thread of the main
+interpreter. Inside a background thread it crashes with:
+
+    RuntimeError: set_wakeup_fd only works in main thread of the main interpreter
+
+Since Flask deliberately owns the main thread, the bot runs in a background
+thread and drives the python-telegram-bot lifecycle MANUALLY instead:
+
+    initialize() -> updater.start_polling() -> start() -> wait forever
+
+(exactly the pattern the PTB documentation prescribes for embedding the
+Application in an existing loop/thread). post_init() is invoked manually
+because run_polling() would normally do it. stop_bot() provides a
+thread-safe graceful-shutdown hook to replace run_polling()'s signal-based
+stop. All business logic is unaffected by any of this.
 """
 
 import asyncio
@@ -821,12 +838,73 @@ def build_application() -> Application:
     return application
 
 
-def run_bot() -> None:
-    """
-    Build the Telegram application and start long polling.
+# ---------------------------------------------------------------------------
+# Background-thread startup (Python 3.12-safe, main-thread-safe for Flask)
+# ---------------------------------------------------------------------------
 
-    Blocks the calling thread — start_bot_thread() runs this in a background
-    thread so the Flask web server (main thread in live.py) stays responsive.
+# Set by the bot thread; used by stop_bot() to request a graceful shutdown
+# from another thread (thread-safe via loop.call_soon_threadsafe()).
+_bot_loop: Optional[asyncio.AbstractEventLoop] = None
+_bot_stop_event: Optional[asyncio.Event] = None
+
+# Last fatal error of the bot thread (surfaced by Flask's /health endpoint).
+_bot_error: Optional[str] = None
+
+
+async def _poll_forever(application: Application) -> None:
+    """
+    Manual PTB lifecycle — the background-thread-safe replacement for
+    Application.run_polling().
+
+    run_polling() cannot be used here because it installs SIGINT/SIGTERM
+    handlers on the event loop (loop.add_signal_handler -> signal.set_wakeup_fd),
+    which only works in the MAIN thread. This coroutine performs the exact same
+    lifecycle manually, as prescribed by the PTB documentation:
+
+        initialize() -> updater.start_polling() -> start() -> wait forever
+        (graceful stop: stop() -> updater.stop() -> shutdown())
+    """
+    await application.initialize()
+
+    # run_polling() would call the post_init hook for us; with the manual
+    # lifecycle we must invoke it ourselves (registers /start /help /game).
+    await post_init(application)
+
+    if application.updater is None:  # defensive; the default build always has one
+        raise RuntimeError("Application has no Updater — cannot start polling.")
+
+    await application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+    await application.start()
+
+    logger.info("Telegram bot is up and polling for updates.")
+
+    if _bot_stop_event is None:  # pragma: no cover — always set by _bot_worker
+        raise RuntimeError("Bot stop event is not initialised.")
+
+    # Block this coroutine (and the thread's event loop) forever. PTB
+    # processes all incoming updates on this loop. The coroutine only
+    # returns if stop_bot() is called from another thread; otherwise the
+    # process is terminated from outside (Render SIGTERM / Ctrl+C).
+    await _bot_stop_event.wait()
+
+    # --- graceful shutdown (only reached via stop_bot()) ---
+    logger.info("Stopping Telegram bot...")
+    await application.stop()
+    await application.updater.stop()
+    await application.shutdown()
+    logger.info("Telegram bot shut down cleanly.")
+
+
+def run_bot(loop: asyncio.AbstractEventLoop) -> None:
+    """
+    Build the Telegram application and run long polling on `loop`.
+
+    Called by _bot_worker() on the bot's background thread, with the loop
+    that was explicitly created and installed for that thread. Blocks the
+    calling thread until the process exits or stop_bot() is used.
     """
     if not BOT_TOKEN:
         logger.critical(
@@ -844,10 +922,11 @@ def run_bot() -> None:
     logger.info("Starting Telegram bot (long polling)...")
     application = build_application()
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
+        # NOTE: Application.run_polling() is deliberately NOT used — it would
+        # install signal handlers (loop.add_signal_handler) and crash with
+        # "set_wakeup_fd only works in main thread" inside this background
+        # thread. _poll_forever() drives the same lifecycle manually.
+        loop.run_until_complete(_poll_forever(application))
     except InvalidToken:
         logger.critical("BOT_TOKEN is invalid. Get a fresh token from @BotFather.")
     except TelegramError as exc:
@@ -855,41 +934,38 @@ def run_bot() -> None:
     logger.info("Telegram bot polling stopped.")
 
 
-# ---------------------------------------------------------------------------
-# Background-thread startup (Python 3.10+/3.12 event-loop fix)
-# ---------------------------------------------------------------------------
-
-# Last fatal error of the bot thread (surfaced by Flask's /health endpoint).
-_bot_error: Optional[str] = None
-
-
 def _bot_worker() -> None:
     """
     Thread target that runs the Telegram bot.
 
-    Python 3.10+ (and especially 3.12) no longer creates an asyncio event
-    loop automatically for non-main threads, and Application.run_polling()
-    calls asyncio.get_event_loop() internally. Without a loop installed for
-    THIS thread, that call raises:
-
-        RuntimeError: There is no current event loop in thread 'telegram-bot'
-
-    We therefore explicitly create and install an event loop for this thread
-    BEFORE starting the bot, and close it again when the bot stops.
+    Python 3.10+/3.12 do NOT create an asyncio event loop automatically for
+    non-main threads, so we explicitly create and install one here BEFORE
+    starting the bot, and close it again when the bot stops.
     """
-    global _bot_error
+    global _bot_error, _bot_loop, _bot_stop_event
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # asyncio.Event() does not bind to a loop until awaited (Python 3.10+),
+    # so creating it here — outside a running loop — is safe on Python 3.12.
+    _bot_stop_event = asyncio.Event()
+    _bot_loop = loop
+
     try:
-        run_bot()
+        run_bot(loop)
     except Exception as exc:
         # Never let the thread die silently — /health reports this error.
         _bot_error = f"{type(exc).__name__}: {exc}"
         logger.exception("Telegram bot thread crashed!")
     finally:
-        # run_polling() does not necessarily close the loop it used.
-        # close() is safe even if the loop is already closed.
+        _bot_loop = None
+        _bot_stop_event = None
+        try:
+            # Give pending async generators a chance to finalize, then close.
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
         try:
             loop.close()
         except Exception:
@@ -903,14 +979,27 @@ def start_bot_thread() -> threading.Thread:
     Called by live.py BEFORE Flask starts, so the architecture stays:
 
         python live.py
-            ├── Telegram bot  -> background thread (own asyncio event loop)
+            ├── Telegram bot  -> background thread (own asyncio event loop,
+            │                    manual PTB lifecycle — no signal handlers)
             └── Flask         -> main thread
 
-    Exactly one thread, one Application, one run_polling() call.
+    Exactly one thread, one Application, one poller — run_polling() is never
+    called and no signal handlers are installed in this thread.
     """
     thread = threading.Thread(target=_bot_worker, name="telegram-bot", daemon=True)
     thread.start()
     return thread
+
+
+def stop_bot() -> None:
+    """
+    Optionally request a graceful bot shutdown from another thread
+    (e.g. a SIGTERM handler in live.py). Thread-safe and a no-op if the bot
+    thread has already exited. Not required for normal operation.
+    """
+    loop, event = _bot_loop, _bot_stop_event
+    if loop is not None and event is not None and loop.is_running():
+        loop.call_soon_threadsafe(event.set)
 
 
 def get_bot_error() -> Optional[str]:
