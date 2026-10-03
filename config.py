@@ -3,29 +3,102 @@ config.py — Central configuration for the Inline Whisper Bot.
 
 All secrets come from environment variables (see README.md). Nothing secret
 is hardcoded in this repository.
+
+Local development: put your variables in a `.env` file in the project root
+(see .env.example). It is loaded automatically if python-dotenv is installed.
+Real environment variables (e.g. set on the Render dashboard) ALWAYS take
+priority over the .env file.
 """
 
 import os
+from pathlib import Path
+from typing import Optional, Tuple, Union
 
-# --- Required ----------------------------------------------------------------
+# --- Optional .env support (local development) --------------------------------
+# load_dotenv() does NOT override variables that already exist in the real
+# environment, so Render dashboard values always win over a stray .env file.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    # python-dotenv not installed — plain environment variables still work.
+    pass
+
+# --- Required -------------------------------------------------------------------
 
 # Bot token from @BotFather. Required for the Telegram bot to run.
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 
-# --- Feature configuration -----------------------------------------------------
+# --- Log channel destination ------------------------------------------------------
+# LOG_CHANNEL is THE destination for whisper logs. It accepts:
+#
+#   @MyWhisperLogs        -> public channel username (preferred)
+#   MyWhisperLogs         -> same as above (the @ is added automatically)
+#   -1001234567890        -> numeric chat/channel ID
+#
+# IMPORTANT: an invite link such as https://t.me/+xxxxxxxx is NOT a send
+# destination and CANNOT be passed to send_message(). If one is configured,
+# the bot reports a clear configuration error at startup (see
+# log_channel_problem()).
+LOG_CHANNEL: str = os.getenv("LOG_CHANNEL", "").strip()
 
-# Telegram channel (or group) that receives a full copy of every delivered
-# whisper for authorized moderation/monitoring. Example: -1001234567890
+# Legacy fallback: if LOG_CHANNEL is not set, a numeric LOG_CHANNEL_ID is used
+# (kept for backward compatibility with earlier deployments).
 try:
     LOG_CHANNEL_ID: int = int(os.getenv("LOG_CHANNEL_ID", "0").strip() or "0")
 except ValueError:
     LOG_CHANNEL_ID = 0
 
-# HTTPS URL of the game opened by the /game Mini App (Web App) button.
-# The developer replaces this via the environment — no fake URL is hardcoded.
-GAME_URL: str = os.getenv("GAME_URL", "").strip()
 
-# --- Tuning --------------------------------------------------------------------
+def _resolve_log_destination() -> Tuple[Optional[Union[str, int]], Optional[Tuple[str, str]]]:
+    """
+    Turn LOG_CHANNEL / LOG_CHANNEL_ID into a Telegram send_message destination.
+
+    Returns (destination, None) on success, or (None, (problem_kind, raw_value))
+    when the configuration cannot be used.
+    """
+    raw = LOG_CHANNEL
+    if raw:
+        low = raw.lower()
+        if low.startswith(("https://t.me/", "http://t.me/", "t.me/")):
+            # Invite links are NOT send destinations — reject loudly.
+            return None, ("invite-link", raw)
+        if raw.startswith("@"):
+            return raw, None
+        if raw.lstrip("-").isdigit():
+            return int(raw), None
+        if raw.replace("_", "").isalnum():
+            # Bare public username without the leading @.
+            return "@" + raw, None
+        return None, ("invalid", raw)
+    if LOG_CHANNEL_ID:
+        return LOG_CHANNEL_ID, None
+    return None, ("unset", "")
+
+
+LOG_CHANNEL_DEST, _LOG_CHANNEL_PROBLEM = _resolve_log_destination()
+
+
+def log_channel_problem() -> Optional[str]:
+    """Human-readable reason why LOG_CHANNEL is unusable (None = configured OK)."""
+    if _LOG_CHANNEL_PROBLEM is None:
+        return None
+    kind, value = _LOG_CHANNEL_PROBLEM
+    if kind == "invite-link":
+        return (
+            f"LOG_CHANNEL='{value}' is an invite link — invite links are NOT send "
+            "destinations. Use the channel's public @username (e.g. @MyWhisperLogs) "
+            "or its numeric ID (e.g. -1001234567890)."
+        )
+    if kind == "invalid":
+        return (
+            f"LOG_CHANNEL='{value}' is not a valid destination — use a public "
+            "@username (e.g. @MyWhisperLogs) or a numeric chat ID."
+        )
+    return "LOG_CHANNEL is not set — whispers will NOT be logged to a channel."
+
+# --- Tuning ------------------------------------------------------------------------
 
 # Port for the Flask health server (Render injects PORT automatically).
 try:
@@ -36,7 +109,7 @@ except ValueError:
 # Maximum length of a single whisper text.
 WHISPER_MAX_LENGTH: int = 1000
 
-# How long (seconds) a prepared whisper stays usable before it expires.
+# How long (seconds) a whisper stays readable before it expires (15 minutes).
 SESSION_TTL_SECONDS: int = 900
 
 
@@ -46,13 +119,11 @@ def config_warnings() -> list:
     if not BOT_TOKEN:
         warnings.append(
             "BOT_TOKEN is not set. The Telegram bot cannot start. "
-            "Set it in your environment (Render -> Environment)."
+            "Set it in your .env file or environment."
         )
-    if not LOG_CHANNEL_ID:
-        warnings.append(
-            "LOG_CHANNEL_ID is not set. Whispers will be delivered but NOT logged "
-            "to a channel."
-        )
+    problem = log_channel_problem()
+    if problem:
+        warnings.append(problem)
     if not GAME_URL:
         warnings.append(
             "GAME_URL is not set. The /game command will reply that the game is "
