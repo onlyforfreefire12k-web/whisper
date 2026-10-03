@@ -1,28 +1,44 @@
 """
 bot.py — Inline Whisper Bot (all Telegram logic lives here).
 
-Whisper flow (100% Telegram-native — no fake "invisible messages"):
+UX (reference whisper-card flow):
 
 1. A user types an inline query in any chat:
-       @BotName your secret message
-   or, with the recipient shortcut:
-       @BotName @recipient your secret message
+       @BotName @TargetUsername secret message
 
-2. Selecting the inline result posts a small "card" into the chat that
-   contains NO whisper text, together with a button:
-       - "🎯 Choose Recipient" -> the bot DMs the sender, who replies with
-                                  the recipient's @username.
-       - "📨 Send Whisper"     -> recipient @username was already in the query.
+2. Selecting the inline result posts a LOCKED WHISPER CARD into the chat:
 
-3. The bot resolves the recipient via Telegram's getChat() API (so the
-   recipient identity can't be spoofed), then:
-       - sends the whisper TEXT as a private message to the recipient,
-       - sends a private confirmation copy to the sender,
-       - updates the public card in the chat (still no whisper text),
-       - posts the complete whisper to the audit log channel.
+       🔐 A whisper message to @TargetUsername.
+       Only they can read the message.
 
-Result: the whisper text is only ever visible to the sender (DM), the
-recipient (DM) and the authorized log channel — never in the group chat.
+       　　🔐
+
+       [ 🔐 ]   <- button, callback_data "whisper:<whisper_id>"
+
+   The actual whisper text is NEVER posted into the chat and is never
+   placed inside callback_data.
+
+3. When ANYONE presses the 🔐 button, the bot compares the presser's
+   Telegram user ID with the recipient ID stored with the whisper:
+       - match    -> the whisper text is revealed ONLY to the presser via an
+                     ephemeral callback popup (answerCallbackQuery alerts are
+                     visible to the presser alone); long whispers are sent as
+                     a private DM instead.
+       - no match -> "❌ This whisper isn't for you."
+
+4. The sender cannot read the whisper unless they explicitly targeted
+   themselves — the same recipient-ID check applies to them.
+
+5. USER REGISTRY: every user who sends /start is registered (Telegram user
+   ID, username, display name). Target usernames are looked up ONLY in this
+   registry — no arbitrary Telegram username searching. If the target never
+   started the bot, the sender is told so (without leaking whisper text).
+
+6. Whispers expire after SESSION_TTL_SECONDS (15 minutes): expired or
+   unknown cards answer "🔒 This whisper has expired." and never reveal text.
+
+7. Every posted whisper is logged (complete text) to the private log channel
+   via ChosenInlineResultHandler — i.e. when the card is actually posted.
 
 Threading model (Render Web Service):
 
@@ -30,27 +46,16 @@ Threading model (Render Web Service):
         ├── Telegram bot -> daemon background thread (start_bot_thread)
         └── Flask        -> main thread (live.py)
 
-IMPORTANT — why Application.run_polling() is NOT used here:
+Event-loop / signal notes (Python 3.12, background thread):
 
-run_polling() is a convenience wrapper designed for the MAIN thread. Besides
-needing an event loop (Python 3.10+/3.12 no longer auto-create one for
-non-main threads), it installs SIGINT/SIGTERM handlers on the loop via
-loop.add_signal_handler(), which asyncio implements with
-signal.set_wakeup_fd() — allowed ONLY in the main thread of the main
-interpreter. Inside a background thread it crashes with:
-
-    RuntimeError: set_wakeup_fd only works in main thread of the main interpreter
-
-Since Flask deliberately owns the main thread, the bot runs in a background
-thread and drives the python-telegram-bot lifecycle MANUALLY instead:
-
-    initialize() -> updater.start_polling() -> start() -> wait forever
-
-(exactly the pattern the PTB documentation prescribes for embedding the
-Application in an existing loop/thread). post_init() is invoked manually
-because run_polling() would normally do it. stop_bot() provides a
-thread-safe graceful-shutdown hook to replace run_polling()'s signal-based
-stop. All business logic is unaffected by any of this.
+* The thread's asyncio event loop is created explicitly with
+  asyncio.new_event_loop() + asyncio.set_event_loop() BEFORE the bot starts
+  (Python 3.10+/3.12 no longer auto-create loops for non-main threads).
+* Application.run_polling() is called with stop_signals=None: by default it
+  installs SIGINT/SIGTERM handlers via loop.add_signal_handler() ->
+  signal.set_wakeup_fd(), which is only allowed in the MAIN thread (Flask
+  owns it). stop_signals=None skips that entirely. close_loop=False because
+  _bot_worker() owns and closes the loop itself.
 """
 
 import asyncio
@@ -78,6 +83,7 @@ from telegram.error import BadRequest, Forbidden, InvalidToken, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -99,11 +105,12 @@ logger = logging.getLogger(__name__)
 # In-memory state (no database required)
 # ---------------------------------------------------------------------------
 
-SESSIONS_KEY = "whisper_sessions"    # sid -> session dict
-AWAITING_KEY = "awaiting_recipient"  # telegram user id (as str) -> sid
+SESSIONS_KEY = "whisper_sessions"   # whisper_id -> session dict
+USERS_KEY = "user_registry"         # telegram user id (as str) -> profile
+USERNAME_INDEX_KEY = "username_index"  # lower-case username -> user id
 
-CB_CHOOSE = "c"  # callback_data prefix: sender wants to pick a recipient
-CB_SEND = "s"    # callback_data prefix: deliver to @username from the query
+# answerCallbackQuery text is limited to 200 characters by Telegram.
+CALLBACK_ANSWER_MAX = 200
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,64}$")
 
@@ -115,9 +122,9 @@ _used_whisper_ids: set = set()
 # ---------------------------------------------------------------------------
 
 def generate_whisper_id() -> str:
-    """Unique whisper ID such as '#W-8F42A1' (never reused)."""
+    """Unique whisper ID such as 'W-8F42A1' (displayed as '#W-8F42A1'). Never reused."""
     while True:
-        whisper_id = "#W-" + secrets.token_hex(3).upper()
+        whisper_id = "W-" + secrets.token_hex(3).upper()
         if whisper_id not in _used_whisper_ids:
             _used_whisper_ids.add(whisper_id)
             return whisper_id
@@ -141,13 +148,8 @@ def fmt_user_block(name: Optional[str], username: Optional[str], user_id: int) -
     return f"{fmt_display_name(name, username)}\nID: <code>{user_id}</code>"
 
 
-def preview_text(text: str, limit: int = 60) -> str:
-    clean = " ".join(text.split())
-    return clean if len(clean) <= limit else clean[: limit - 1] + "…"
-
-
 def parse_inline_query(raw: str) -> Tuple[Optional[str], str]:
-    """Split '@BotName @user message text' into ('user', 'message text')."""
+    """Split '@target_username whisper text' into ('target_username', 'whisper text')."""
     text = (raw or "").strip()
     if text.startswith("@"):
         parts = text.split(maxsplit=1)
@@ -158,80 +160,89 @@ def parse_inline_query(raw: str) -> Tuple[Optional[str], str]:
     return None, text
 
 
-def parse_username(text: Optional[str]) -> Optional[str]:
-    """Extract a bare username from '@name' / 'name' text, or None."""
-    if not text:
-        return None
-    candidate = text.strip()
-    if candidate.startswith("@"):
-        candidate = candidate[1:]
-    candidate = candidate.strip()
-    if candidate and _USERNAME_RE.match(candidate):
-        return candidate
-    return None
-
+# ---------------------------------------------------------------------------
+# Registry access (bot_data-backed, in-memory)
+# ---------------------------------------------------------------------------
 
 def get_sessions(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
     return context.application.bot_data.setdefault(SESSIONS_KEY, {})
 
 
-def get_awaiting(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, str]:
-    return context.application.bot_data.setdefault(AWAITING_KEY, {})
+def get_users(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
+    return context.application.bot_data.setdefault(USERS_KEY, {})
+
+
+def get_username_index(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, int]:
+    return context.application.bot_data.setdefault(USERNAME_INDEX_KEY, {})
+
+
+def register_user(context: ContextTypes.DEFAULT_TYPE, user: Any) -> None:
+    """Store/update a user in the registry: Telegram ID, username, display name.
+
+    Called on /start (and whenever Telegram provides the user). The data comes
+    straight from the Telegram update — never from user-typed text — so it
+    cannot be spoofed.
+    """
+    if user is None:
+        return
+    get_users(context)[str(user.id)] = {
+        "id": user.id,
+        "username": user.username,
+        "name": user.first_name or user.full_name or "Unknown",
+    }
+    if user.username:
+        get_username_index(context)[user.username.lower()] = user.id
+
+
+def find_registered_user(
+    context: ContextTypes.DEFAULT_TYPE, username: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Look up a target username in the registry ONLY (no Telegram username search)."""
+    if not username:
+        return None
+    user_id = get_username_index(context).get(username.lower())
+    if user_id is None:
+        return None
+    return get_users(context).get(str(user_id))
 
 
 def prune_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Drop whisper sessions that are older than SESSION_TTL_SECONDS."""
     now = time.time()
     sessions = get_sessions(context)
-    for sid in [sid for sid, s in sessions.items() if now - s["created_at"] > SESSION_TTL_SECONDS]:
-        sessions.pop(sid, None)
-    awaiting = get_awaiting(context)
-    for user_key in [uid for uid, sid in awaiting.items() if sid not in sessions]:
-        awaiting.pop(user_key, None)
+    for wid in [
+        wid for wid, s in sessions.items() if now - s["created_at"] > SESSION_TTL_SECONDS
+    ]:
+        sessions.pop(wid, None)
 
 
 # ---------------------------------------------------------------------------
 # Message builders (all user input is HTML-escaped)
 # ---------------------------------------------------------------------------
 
-def build_pending_card(session: Dict[str, Any], choosing: bool = False) -> str:
-    sender = fmt_display_name(session["sender_name"], session["sender_username"])
-    status_line = (
-        "🕓 The sender is choosing the recipient..."
-        if choosing
-        else "🔒 The whisper will be delivered privately."
-    )
+def build_whisper_card(session: Dict[str, Any]) -> str:
+    """The public card posted into the chat. Contains NO whisper text."""
+    target = "@" + html.escape(session["recipient_username"])
     return (
-        "🤫 <b>Whisper incoming...</b>\n"
-        f"👤 {sender}\n"
-        f"{status_line}\n"
-        f"🆔 <code>{session['whisper_id']}</code>"
+        "🔐 A whisper message to <b>" + target + "</b>.\n"
+        "Only they can read the message.\n\n"
+        "　　🔐"
     )
 
 
-def build_mention_card(session: Dict[str, Any]) -> str:
+def build_reveal_dm(session: Dict[str, Any]) -> str:
+    """Private message with the full whisper, sent only to the verified recipient."""
     sender = fmt_display_name(session["sender_name"], session["sender_username"])
-    recipient = "@" + html.escape(session.get("recipient_username") or "")
     return (
-        "🤫 <b>A whisper is waiting...</b>\n"
-        f"👤 {sender} → 🎯 {recipient}\n"
-        "🔒 Press “Send Whisper” to deliver it privately.\n"
-        f"🆔 <code>{session['whisper_id']}</code>"
-    )
-
-
-def build_delivered_card(session: Dict[str, Any]) -> str:
-    sender = fmt_display_name(session["sender_name"], session["sender_username"])
-    recipient = fmt_display_name(session.get("recipient_name"), session.get("recipient_username"))
-    return (
-        "✅ <b>Whisper delivered!</b>\n"
-        f"👤 {sender} → 🎯 {recipient}\n"
-        "🔒 The whisper text was sent privately to the recipient.\n"
-        f"🆔 <code>{session['whisper_id']}</code>"
+        f"🤫 <b>Whisper #{session['whisper_id']}</b>\n\n"
+        f"👤 <b>From:</b> {sender}\n"
+        f"🕐 <b>Time:</b> {format_time(session['created_at'])}\n\n"
+        f"💬 <b>Whisper:</b>\n{html.escape(session['text'])}"
     )
 
 
 def build_log_text(session: Dict[str, Any]) -> str:
+    """Complete moderation log — sent ONLY to the private log channel."""
     sender_block = fmt_user_block(
         session["sender_name"], session["sender_username"], session["sender_id"]
     )
@@ -245,20 +256,20 @@ def build_log_text(session: Dict[str, Any]) -> str:
         f"👤 <b>Sender:</b>\n{sender_block}\n\n"
         f"🎯 <b>Recipient:</b>\n{recipient_block}\n\n"
         f"💬 <b>Whisper text:</b>\n{html.escape(session['text'])}\n\n"
-        f"🕐 <b>Time:</b>\n{format_time(session.get('delivered_at'))}\n\n"
-        f"🆔 <b>Whisper ID:</b>\n{session['whisper_id']}"
+        f"🕐 <b>Time:</b>\n{format_time(session.get('posted_at') or session['created_at'])}\n\n"
+        f"🆔 <b>Whisper ID:</b>\n#{session['whisper_id']}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Whisper delivery + audit log
+# Audit log (best-effort, never crashes the bot)
 # ---------------------------------------------------------------------------
 
 async def log_whisper(context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]) -> None:
     """Best-effort audit log to LOG_CHANNEL_ID. Never raises."""
     if not LOG_CHANNEL_ID:
         logger.warning(
-            "LOG_CHANNEL_ID is not configured — whisper %s was not logged.",
+            "LOG_CHANNEL_ID is not configured — whisper #%s was not logged.",
             session["whisper_id"],
         )
         return
@@ -271,133 +282,16 @@ async def log_whisper(context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any
     except Forbidden as exc:
         logger.error(
             "Cannot post to LOG_CHANNEL_ID (%s) — is the bot still an admin with "
-            "'Post Messages' rights? Whisper %s not logged: %s",
+            "'Post Messages' rights? Whisper #%s not logged: %s",
             LOG_CHANNEL_ID, session["whisper_id"], exc,
         )
     except TelegramError as exc:
         logger.error(
-            "Failed to log whisper %s to the log channel: %s",
+            "Failed to log whisper #%s to the log channel: %s",
             session["whisper_id"], exc,
         )
     except Exception:
-        logger.exception("Unexpected error while logging whisper %s", session["whisper_id"])
-
-
-async def resolve_recipient(
-    context: ContextTypes.DEFAULT_TYPE, username: str
-) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Resolve '@username' to a real Telegram user via getChat().
-
-    Returns (chat, None) on success or (None, user_facing_error_message).
-    Usernames can therefore never be spoofed — the identity always comes
-    straight from Telegram.
-    """
-    try:
-        chat = await context.bot.get_chat(f"@{username}")
-    except BadRequest:
-        return None, (
-            f"❌ I couldn't find @{html.escape(username)}. "
-            "Double-check the username and try again."
-        )
-    except Forbidden:
-        return None, f"❌ Telegram refused the lookup for @{html.escape(username)}."
-    except TelegramError as exc:
-        logger.error("get_chat failed for @%s: %s", username, exc)
-        return None, "⚠️ Telegram lookup failed. Please try again in a moment."
-
-    if chat.type != ChatType.PRIVATE:
-        return None, (
-            f"❌ @{html.escape(username)} is not a personal account — "
-            "whispers can only be sent to people."
-        )
-    if chat.id == context.bot.id:
-        return None, "🤖 Nice try — you can't whisper to me!"
-    return chat, None
-
-
-async def deliver_whisper(
-    context: ContextTypes.DEFAULT_TYPE,
-    session: Dict[str, Any],
-    recipient_chat: Any,
-) -> bool:
-    """
-    Deliver the whisper. Returns True on success.
-
-    Order: recipient DM (critical) -> sender copy -> public card update ->
-    audit log. Every step after the recipient DM is best-effort; failures
-    are logged and never crash the bot.
-    """
-    whisper_id = session["whisper_id"]
-    sender_line = fmt_display_name(session["sender_name"], session["sender_username"])
-    recipient_name = recipient_chat.first_name or recipient_chat.title or "Unknown"
-    recipient_username = recipient_chat.username or session.get("recipient_username")
-    when_str = format_time(time.time())
-
-    session["recipient_id"] = recipient_chat.id
-    session["recipient_name"] = recipient_name
-    session["recipient_username"] = recipient_username
-    session["delivered_at"] = time.time()
-
-    # 1) Private whisper -> recipient (the only critical step).
-    recipient_text = (
-        "🤫 <b>You've received a whisper!</b>\n\n"
-        f"👤 <b>From:</b> {sender_line}\n"
-        f"🆔 <b>Whisper ID:</b> {whisper_id}\n"
-        f"🕐 <b>Time:</b> {when_str}\n\n"
-        f"💬 <b>Whisper:</b>\n{html.escape(session['text'])}"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=recipient_chat.id, text=recipient_text, parse_mode=ParseMode.HTML
-        )
-    except Forbidden:
-        logger.info(
-            "Recipient %s (@%s) cannot be messaged (never started the bot or blocked it).",
-            recipient_chat.id, recipient_username,
-        )
-        return False
-    except TelegramError as exc:
-        logger.error("Failed to deliver whisper %s: %s", whisper_id, exc)
-        return False
-
-    session["status"] = "delivered"
-
-    # 2) Private confirmation -> sender (best effort).
-    sender_text = (
-        "✅ <b>Whisper delivered!</b>\n\n"
-        f"🎯 <b>To:</b> {fmt_display_name(recipient_name, recipient_username)}\n"
-        f"🆔 <b>Whisper ID:</b> {whisper_id}\n"
-        f"🕐 <b>Time:</b> {when_str}\n\n"
-        f"💬 <b>Whisper:</b>\n{html.escape(session['text'])}"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=session["sender_id"], text=sender_text, parse_mode=ParseMode.HTML
-        )
-    except Forbidden:
-        logger.info(
-            "Sender %s cannot be DM'd (blocked bot); skipping confirmation.",
-            session["sender_id"],
-        )
-    except TelegramError as exc:
-        logger.warning("Could not send confirmation for whisper %s: %s", whisper_id, exc)
-
-    # 3) Update the public card in the original chat (best effort).
-    if session.get("inline_message_id"):
-        try:
-            await context.bot.edit_message_text(
-                inline_message_id=session["inline_message_id"],
-                text=build_delivered_card(session),
-                parse_mode=ParseMode.HTML,
-                reply_markup=None,
-            )
-        except TelegramError as exc:
-            logger.debug("Could not update whisper card %s: %s", whisper_id, exc)
-
-    # 4) Audit log (best effort).
-    await log_whisper(context, session)
-    return True
+        logger.exception("Unexpected error while logging whisper #%s", session["whisper_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -405,21 +299,28 @@ async def deliver_whisper(
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Register/update the user in the registry (ID, username, display name).
+    user = update.effective_user
+    if user is not None:
+        register_user(context, user)
+
     if update.message is None:
         return
     bot_username = context.bot.username
     text = (
         "🔐 <b>Inline Whisper Bot</b>\n\n"
-        "Send secret whispers in <b>any</b> Telegram chat. The whisper text is never "
-        "posted in the chat — it is delivered privately, so only <b>you</b> and the "
-        "<b>recipient</b> can read it.\n\n"
+        "You're registered! ✅ People can now send you whispers.\n\n"
         "📌 <b>How to send a whisper</b>\n"
         "1️⃣ In any chat, type:\n"
-        f"    <code>@{bot_username} your secret message</code>\n"
+        f"    <code>@{bot_username} @username your secret message</code>\n"
         "2️⃣ Tap the whisper result that appears.\n"
-        "3️⃣ Press the button on the card and pick the recipient — done! 🤫\n\n"
-        "⚡ <b>Shortcut</b> — already know the recipient?\n"
-        f"    <code>@{bot_username} @username your secret message</code>\n\n"
+        "3️⃣ A locked card is posted in the chat:\n\n"
+        "    🔐 A whisper message to @username.\n"
+        "    Only they can read the message.\n\n"
+        "4️⃣ Only <b>@username</b> can press the 🔐 button to read it — everyone "
+        "else sees “❌ This whisper isn't for you.”\n\n"
+        "ℹ️ The whisper text is never shown in the chat — not even for you as the "
+        "sender (unless you whispered to yourself 😉).\n\n"
         "Type /help for details, or /game to play. 🎮"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -432,21 +333,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "📖 <b>Whisper Bot — Help</b>\n\n"
         "🤫 <b>Sending a whisper</b>\n"
-        f"• Type <code>@{bot_username} your message</code> in any chat, tap the result, "
-        "then choose the recipient from the button on the card.\n"
-        f"• Shortcut: <code>@{bot_username} @username your message</code> — the card gets "
-        "a “📨 Send Whisper” button that delivers straight to that user.\n"
-        "• The whisper text is never shown in the chat. It is delivered privately to the "
-        "recipient, with a confirmation copy for you.\n\n"
+        f"• Type <code>@{bot_username} @username your secret message</code> in any chat "
+        "and tap the result.\n"
+        "• A locked card is posted in the chat — the whisper text is never shown there.\n"
+        "• Only the recipient can press the 🔐 button to read the whisper (verified by "
+        "their Telegram user ID). Everyone else — including the sender — sees "
+        "“❌ This whisper isn't for you.”\n"
+        "• Short whispers open as a private popup; long ones are sent to the "
+        "recipient's private chat.\n\n"
+        "✅ <b>Receiving whispers</b>\n"
+        "• You must press Start on this bot once — that registers your @username so "
+        "people can whisper to you.\n\n"
         "🎮 <b>Game</b>\n"
         "• Send /game to open the mini app game right inside Telegram.\n\n"
         "ℹ️ <b>Good to know</b>\n"
         f"• A whisper needs text — up to {WHISPER_MAX_LENGTH} characters.\n"
-        "• The recipient must have pressed Start on this bot at least once; otherwise "
-        "Telegram does not allow me to message them.\n"
-        "• Every delivered whisper is recorded in the bot's private log channel for "
-        "moderation and abuse reports.\n"
-        f"• Unsent whispers expire after {SESSION_TTL_SECONDS // 60} minutes."
+        f"• Whispers expire after {SESSION_TTL_SECONDS // 60} minutes — expired cards "
+        "show “🔒 This whisper has expired.”\n"
+        "• Every whisper is recorded in the bot's private log channel for moderation "
+        "and abuse reports."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -500,21 +405,24 @@ async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Inline mode
+# Inline mode — whisper creation
 # ---------------------------------------------------------------------------
 
-def _help_result(context: ContextTypes.DEFAULT_TYPE) -> InlineQueryResultArticle:
+def _format_hint_result(context: ContextTypes.DEFAULT_TYPE) -> InlineQueryResultArticle:
     bot_username = context.bot.username
     return InlineQueryResultArticle(
         id="howto-" + secrets.token_hex(4),
-        title="✍️ Type your whisper message",
-        description=f"Example: @{bot_username} your secret message",
+        title="✍️ Format: @bot @username message",
+        description="Example: @bot @rahul meet me at 5?",
         input_message_content=InputTextMessageContent(
             message_text=(
-                "🔐 <b>Inline Whisper Bot</b>\n\n"
-                "Type your whisper <b>after</b> the bot mention:\n"
-                f"<code>@{bot_username} your secret message</code>\n\n"
-                "Then tap the result and choose the recipient. 🤫"
+                "🔐 <b>How to send a whisper</b>\n\n"
+                "Type your whisper like this:\n"
+                f"<code>@{bot_username} @username your secret message</code>\n\n"
+                "Example:\n"
+                f"<code>@{bot_username} @rahul meet me at 5?</code>\n\n"
+                "A locked whisper card is posted in the chat — only @username can "
+                "open it with the 🔐 button. 🤫"
             ),
             parse_mode=ParseMode.HTML,
         ),
@@ -536,6 +444,30 @@ def _too_long_result() -> InlineQueryResultArticle:
     )
 
 
+def _not_started_result(
+    context: ContextTypes.DEFAULT_TYPE, username: str
+) -> InlineQueryResultArticle:
+    """Shown when the target username is not in the registry (never started the bot).
+
+    NOTE: contains NO whisper text — the whisper must not leak into the chat.
+    """
+    bot_username = context.bot.username
+    safe = html.escape(username)
+    return InlineQueryResultArticle(
+        id="notstarted-" + secrets.token_hex(4),
+        title=f"❌ @{username} can't receive whispers yet",
+        description="They must start the bot once first",
+        input_message_content=InputTextMessageContent(
+            message_text=(
+                f"❌ <b>@{safe}</b> can't receive whispers yet.\n\n"
+                f"They must open <code>@{bot_username}</code> and press <b>Start</b> "
+                "once. After that you can send them a whisper. 🤫"
+            ),
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+
+
 async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     inline_query = update.inline_query
     if inline_query is None:
@@ -543,14 +475,14 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = inline_query.from_user
     prune_sessions(context)
 
-    recipient_username, whisper_text = parse_inline_query(inline_query.query)
+    target_username, whisper_text = parse_inline_query(inline_query.query)
     whisper_text = whisper_text.strip()
 
-    # Empty whisper -> show a friendly hint instead of a sendable whisper.
-    if not whisper_text:
+    # Empty whisper or missing target -> friendly format hint (no whisper text posted).
+    if not target_username or not whisper_text:
         try:
             await inline_query.answer(
-                results=[_help_result(context)], cache_time=1, is_personal=True
+                results=[_format_hint_result(context)], cache_time=1, is_personal=True
             )
         except TelegramError as exc:
             logger.error("Failed to answer inline query: %s", exc)
@@ -566,42 +498,46 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error("Failed to answer inline query: %s", exc)
         return
 
-    sid = secrets.token_hex(8)
+    # Registry-only recipient lookup — no arbitrary Telegram username searching.
+    recipient = find_registered_user(context, target_username)
+    if recipient is None:
+        try:
+            await inline_query.answer(
+                results=[_not_started_result(context, target_username)],
+                cache_time=1,
+                is_personal=True,
+            )
+        except TelegramError as exc:
+            logger.error("Failed to answer inline query: %s", exc)
+        return
+
+    wid = generate_whisper_id()
     session: Dict[str, Any] = {
-        "sid": sid,
-        "whisper_id": generate_whisper_id(),
+        "whisper_id": wid,
         "sender_id": user.id,
         "sender_name": user.first_name or user.full_name or "Unknown",
         "sender_username": user.username,
+        # Recipient data comes from the registry (their own /start) — never spoofed.
+        "recipient_id": recipient["id"],
+        "recipient_name": recipient["name"],
+        "recipient_username": recipient["username"] or target_username,
         "text": whisper_text,
-        "recipient_username": recipient_username,  # None unless '@user msg' shortcut
-        "recipient_id": None,
-        "recipient_name": None,
-        "inline_message_id": None,
-        "status": "pending",
+        "status": "created",
         "created_at": time.time(),
+        "posted_at": None,
     }
-    get_sessions(context)[sid] = session
-
-    if recipient_username:
-        title = f"🕊 Whisper to @{recipient_username}"
-        card = build_mention_card(session)
-        button = InlineKeyboardButton(text="📨 Send Whisper", callback_data=f"{CB_SEND}|{sid}")
-    else:
-        title = "🤫 Send a Whisper"
-        card = build_pending_card(session)
-        button = InlineKeyboardButton(
-            text="🎯 Choose Recipient", callback_data=f"{CB_CHOOSE}|{sid}"
-        )
+    get_sessions(context)[wid] = session
 
     result = InlineQueryResultArticle(
-        id=sid,
-        title=title,
-        description=f"Tap to prepare: {preview_text(whisper_text)}",
+        id=wid,
+        title=f"🔐 A whisper message to @{session['recipient_username']}",
+        description="Only they can read the message — tap to post",
         input_message_content=InputTextMessageContent(
-            message_text=card, parse_mode=ParseMode.HTML
+            message_text=build_whisper_card(session), parse_mode=ParseMode.HTML
         ),
-        reply_markup=InlineKeyboardMarkup([[button]]),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text="🔐", callback_data=f"whisper:{wid}")]]
+        ),
     )
     try:
         await inline_query.answer(results=[result], cache_time=0, is_personal=True)
@@ -613,184 +549,116 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
 
 
+async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fires when the sender actually posts the whisper card into a chat."""
+    chosen = update.chosen_inline_result
+    if chosen is None:
+        return
+    sessions = get_sessions(context)
+    session = sessions.get(chosen.result_id)
+    if session is None:
+        return
+    if session.get("posted_at") is not None:
+        return  # Same whisper posted twice — log it only once.
+
+    session["status"] = "posted"
+    session["posted_at"] = time.time()
+
+    # The card is now live in the chat: log the COMPLETE whisper (moderation).
+    await log_whisper(context, session)
+
+
 # ---------------------------------------------------------------------------
-# Button presses (on the inline "cards")
+# 🔐 Read button — verified, private reveal
 # ---------------------------------------------------------------------------
+
+async def _safe_answer(query: CallbackQuery, text: str, alert: bool = True) -> None:
+    """Answer a callback query; never raise (the query may simply be too old)."""
+    try:
+        await query.answer(text=text, show_alert=alert)
+    except TelegramError as exc:
+        logger.debug("Could not answer callback query: %s", exc)
+
+
+async def reveal_whisper(
+    query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]
+) -> None:
+    """Reveal the whisper text ONLY to the already-verified presser."""
+    text = session["text"]
+
+    # Preferred: ephemeral popup. Telegram shows callback answers (with
+    # show_alert=True) to the user who pressed the button ALONE — nothing is
+    # posted or edited in the chat. answerCallbackQuery allows max 200 chars.
+    if len(text) <= CALLBACK_ANSWER_MAX:
+        try:
+            await query.answer(text=text, show_alert=True)
+            return
+        except TelegramError as exc:
+            logger.debug("Popup reveal failed (%s); falling back to private DM.", exc)
+
+    # Longer whispers (or popup failure): send the full text to the
+    # recipient's private chat. They must have started the bot, so this
+    # normally works.
+    try:
+        await context.bot.send_message(
+            chat_id=session["recipient_id"],
+            text=build_reveal_dm(session),
+            parse_mode=ParseMode.HTML,
+        )
+        await _safe_answer(query, "📩 The whisper was opened in your private chat.")
+    except TelegramError as exc:
+        logger.warning(
+            "Could not privately reveal whisper #%s: %s", session["whisper_id"], exc
+        )
+        # Last resort: truncated popup — still visible only to the presser.
+        await _safe_answer(query, text[: CALLBACK_ANSWER_MAX - 1] + "…")
+
 
 async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None or not query.data:
         return
-    try:
-        action, sid = query.data.split("|", 1)
-    except ValueError:
+    if not query.data.startswith("whisper:"):
         await query.answer()
         return
 
+    wid = query.data.split(":", 1)[1].strip()
     sessions = get_sessions(context)
-    session = sessions.get(sid)
+    session = sessions.get(wid)
 
+    # Unknown or expired whispers must NEVER reveal text.
     if session is None:
-        await query.answer("⌛ This whisper has expired. Please send a new one.", show_alert=True)
-        return
-    if session["status"] == "delivered":
-        await query.answer("✅ This whisper was already delivered.", show_alert=True)
+        await _safe_answer(query, "🔒 This whisper has expired.")
         return
     if time.time() - session["created_at"] > SESSION_TTL_SECONDS:
-        sessions.pop(sid, None)
-        await query.answer("⌛ This whisper has expired. Please send a new one.", show_alert=True)
-        return
-    if query.from_user.id != session["sender_id"]:
-        await query.answer("🚫 Only the sender can manage this whisper.", show_alert=True)
+        sessions.pop(wid, None)
+        await _safe_answer(query, "🔒 This whisper has expired.")
         return
 
-    if action == CB_CHOOSE:
-        await handle_choose_recipient(query, context, session)
-    elif action == CB_SEND:
-        await handle_send_now(query, context, session)
-    else:
-        await query.answer()
-
-
-async def handle_choose_recipient(
-    query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]
-) -> None:
-    """Sender pressed '🎯 Choose Recipient' -> DM them for a @username."""
-    session["status"] = "awaiting_recipient"
-    session["inline_message_id"] = query.inline_message_id or session.get("inline_message_id")
-    get_awaiting(context)[str(session["sender_id"])] = session["sid"]
-
-    prompt = (
-        f"🤫 <b>Whisper {session['whisper_id']}</b>\n\n"
-        "Send me the <b>@username</b> of the person who should receive this whisper.\n\n"
-        "Example: <code>@rahul</code>"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=session["sender_id"], text=prompt, parse_mode=ParseMode.HTML
-        )
-    except Forbidden:
-        get_awaiting(context).pop(str(session["sender_id"]), None)
-        session["status"] = "pending"
-        await query.answer(
-            "📩 I can't message you privately. Open my chat, press Start, then tap the "
-            "button again.",
-            show_alert=True,
-        )
-        return
-    except TelegramError as exc:
-        logger.error("Could not DM the recipient prompt to %s: %s", session["sender_id"], exc)
-        get_awaiting(context).pop(str(session["sender_id"]), None)
-        session["status"] = "pending"
-        await query.answer(
-            "⚠️ Something went wrong. Please tap the button again.", show_alert=True
-        )
+    # SECURITY: verify presser identity against the stored recipient ID.
+    # The sender is NOT exempt — they only pass if they targeted themselves.
+    if query.from_user.id != session["recipient_id"]:
+        await _safe_answer(query, "❌ This whisper isn't for you.")
         return
 
-    await query.answer("📩 Check my private message to choose the recipient.")
-
-    # Visible feedback on the card, but keep the button usable for retries.
-    if session.get("inline_message_id"):
-        try:
-            await context.bot.edit_message_text(
-                inline_message_id=session["inline_message_id"],
-                text=build_pending_card(session, choosing=True),
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton(
-                        text="🎯 Choose Recipient",
-                        callback_data=f"{CB_CHOOSE}|{session['sid']}",
-                    )]]
-                ),
-            )
-        except TelegramError as exc:
-            logger.debug("Could not update whisper card: %s", exc)
-
-
-async def handle_send_now(
-    query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]
-) -> None:
-    """Sender pressed '📨 Send Whisper' (recipient @username from the query)."""
-    username = session.get("recipient_username")
-    if not username:
-        await query.answer("⚠️ No recipient stored for this whisper.", show_alert=True)
-        return
-
-    recipient_chat, error = await resolve_recipient(context, username)
-    if recipient_chat is None:
-        await query.answer(error, show_alert=True)
-        return
-
-    delivered = await deliver_whisper(context, session, recipient_chat)
-    if delivered:
-        await query.answer("✅ Whisper delivered!")
-    else:
-        await query.answer(
-            f"❌ @{username} can't receive whispers yet.\n\n"
-            "They must open my chat and press Start first.",
-            show_alert=True,
-        )
+    await reveal_whisper(query, context, session)
 
 
 # ---------------------------------------------------------------------------
-# Private chat: sender replies with the recipient's @username
+# Private chat fallback (no DM conversation flow anymore)
 # ---------------------------------------------------------------------------
 
 async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    user = update.effective_user
-    if message is None or user is None or not message.text:
+    if message is None or not message.text:
         return
-
-    awaiting = get_awaiting(context)
-    sid = awaiting.get(str(user.id))
-
-    if sid is None:
-        await message.reply_text(
-            "🤫 I deliver whispers!\n\n"
-            "Type /help to learn how to use me, or send /game to play. 🎮"
-        )
-        return
-
-    sessions = get_sessions(context)
-    session = sessions.get(sid)
-    if (
-        session is None
-        or session["status"] == "delivered"
-        or time.time() - session["created_at"] > SESSION_TTL_SECONDS
-    ):
-        awaiting.pop(str(user.id), None)
-        await message.reply_text("⌛ That whisper has expired. Please send a new one.")
-        return
-
-    username = parse_username(message.text)
-    if username is None:
-        await message.reply_text(
-            "❌ That doesn't look like a Telegram username.\n"
-            "Send it like this: <code>@rahul</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    recipient_chat, error = await resolve_recipient(context, username)
-    if recipient_chat is None:
-        await message.reply_text(error, parse_mode=ParseMode.HTML)
-        return  # Keep the session so the sender can try another username.
-
-    delivered = await deliver_whisper(context, session, recipient_chat)
-    if delivered:
-        awaiting.pop(str(user.id), None)
-        await message.reply_text(
-            f"✅ Whisper <b>{session['whisper_id']}</b> delivered to "
-            f"{fmt_display_name(session.get('recipient_name'), session.get('recipient_username'))}! 🤫",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await message.reply_text(
-            f"❌ @{html.escape(username)} can't receive whispers yet.\n"
-            "They must open my chat and press Start first.\n\n"
-            "Send another @username to try again."
-        )
+    await message.reply_text(
+        "🤫 I deliver whispers!\n\n"
+        "To send one, type this in any chat:\n"
+        f"<code>@{context.bot.username} @username your secret message</code>\n\n"
+        "Type /help to learn more, or send /game to play. 🎮",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -821,13 +689,16 @@ def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.bot_data[SESSIONS_KEY] = {}
-    application.bot_data[AWAITING_KEY] = {}
+    application.bot_data[USERS_KEY] = {}
+    application.bot_data[USERNAME_INDEX_KEY] = {}
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("game", cmd_game))
     application.add_handler(InlineQueryHandler(on_inline_query))
-    application.add_handler(CallbackQueryHandler(on_callback_query, pattern=r"^[cs]\|"))
+    # Fires when the card is actually posted -> whisper log entry.
+    application.add_handler(ChosenInlineResultHandler(on_chosen_inline_result))
+    application.add_handler(CallbackQueryHandler(on_callback_query, pattern=r"^whisper:"))
     application.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
@@ -838,73 +709,13 @@ def build_application() -> Application:
     return application
 
 
-# ---------------------------------------------------------------------------
-# Background-thread startup (Python 3.12-safe, main-thread-safe for Flask)
-# ---------------------------------------------------------------------------
-
-# Set by the bot thread; used by stop_bot() to request a graceful shutdown
-# from another thread (thread-safe via loop.call_soon_threadsafe()).
-_bot_loop: Optional[asyncio.AbstractEventLoop] = None
-_bot_stop_event: Optional[asyncio.Event] = None
-
-# Last fatal error of the bot thread (surfaced by Flask's /health endpoint).
-_bot_error: Optional[str] = None
-
-
-async def _poll_forever(application: Application) -> None:
+def run_bot() -> None:
     """
-    Manual PTB lifecycle — the background-thread-safe replacement for
-    Application.run_polling().
+    Build the Telegram application and start long polling.
 
-    run_polling() cannot be used here because it installs SIGINT/SIGTERM
-    handlers on the event loop (loop.add_signal_handler -> signal.set_wakeup_fd),
-    which only works in the MAIN thread. This coroutine performs the exact same
-    lifecycle manually, as prescribed by the PTB documentation:
-
-        initialize() -> updater.start_polling() -> start() -> wait forever
-        (graceful stop: stop() -> updater.stop() -> shutdown())
-    """
-    await application.initialize()
-
-    # run_polling() would call the post_init hook for us; with the manual
-    # lifecycle we must invoke it ourselves (registers /start /help /game).
-    await post_init(application)
-
-    if application.updater is None:  # defensive; the default build always has one
-        raise RuntimeError("Application has no Updater — cannot start polling.")
-
-    await application.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-    await application.start()
-
-    logger.info("Telegram bot is up and polling for updates.")
-
-    if _bot_stop_event is None:  # pragma: no cover — always set by _bot_worker
-        raise RuntimeError("Bot stop event is not initialised.")
-
-    # Block this coroutine (and the thread's event loop) forever. PTB
-    # processes all incoming updates on this loop. The coroutine only
-    # returns if stop_bot() is called from another thread; otherwise the
-    # process is terminated from outside (Render SIGTERM / Ctrl+C).
-    await _bot_stop_event.wait()
-
-    # --- graceful shutdown (only reached via stop_bot()) ---
-    logger.info("Stopping Telegram bot...")
-    await application.stop()
-    await application.updater.stop()
-    await application.shutdown()
-    logger.info("Telegram bot shut down cleanly.")
-
-
-def run_bot(loop: asyncio.AbstractEventLoop) -> None:
-    """
-    Build the Telegram application and run long polling on `loop`.
-
-    Called by _bot_worker() on the bot's background thread, with the loop
-    that was explicitly created and installed for that thread. Blocks the
-    calling thread until the process exits or stop_bot() is used.
+    Blocks the calling thread — start_bot_thread() runs this in a background
+    thread (with its own explicitly created asyncio event loop) so the Flask
+    web server in the main thread stays responsive.
     """
     if not BOT_TOKEN:
         logger.critical(
@@ -922,16 +733,27 @@ def run_bot(loop: asyncio.AbstractEventLoop) -> None:
     logger.info("Starting Telegram bot (long polling)...")
     application = build_application()
     try:
-        # NOTE: Application.run_polling() is deliberately NOT used — it would
-        # install signal handlers (loop.add_signal_handler) and crash with
-        # "set_wakeup_fd only works in main thread" inside this background
-        # thread. _poll_forever() drives the same lifecycle manually.
-        loop.run_until_complete(_poll_forever(application))
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False,   # _bot_worker() owns and closes the loop itself.
+            stop_signals=None,  # CRITICAL: no SIGINT/SIGTERM handlers on this
+                                # background thread's loop — set_wakeup_fd()
+                                # only works in the main thread (Flask owns it).
+        )
     except InvalidToken:
         logger.critical("BOT_TOKEN is invalid. Get a fresh token from @BotFather.")
     except TelegramError as exc:
         logger.critical("Telegram bot stopped with an API error: %s", exc)
     logger.info("Telegram bot polling stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Background-thread startup (Python 3.12 event-loop fix + stop_signals=None)
+# ---------------------------------------------------------------------------
+
+# Last fatal error of the bot thread (surfaced by Flask's /health endpoint).
+_bot_error: Optional[str] = None
 
 
 def _bot_worker() -> None:
@@ -942,25 +764,17 @@ def _bot_worker() -> None:
     non-main threads, so we explicitly create and install one here BEFORE
     starting the bot, and close it again when the bot stops.
     """
-    global _bot_error, _bot_loop, _bot_stop_event
+    global _bot_error
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    # asyncio.Event() does not bind to a loop until awaited (Python 3.10+),
-    # so creating it here — outside a running loop — is safe on Python 3.12.
-    _bot_stop_event = asyncio.Event()
-    _bot_loop = loop
-
     try:
-        run_bot(loop)
+        run_bot()
     except Exception as exc:
         # Never let the thread die silently — /health reports this error.
         _bot_error = f"{type(exc).__name__}: {exc}"
         logger.exception("Telegram bot thread crashed!")
     finally:
-        _bot_loop = None
-        _bot_stop_event = None
         try:
             # Give pending async generators a chance to finalize, then close.
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -980,26 +794,14 @@ def start_bot_thread() -> threading.Thread:
 
         python live.py
             ├── Telegram bot  -> background thread (own asyncio event loop,
-            │                    manual PTB lifecycle — no signal handlers)
+            │                    run_polling(stop_signals=None))
             └── Flask         -> main thread
 
-    Exactly one thread, one Application, one poller — run_polling() is never
-    called and no signal handlers are installed in this thread.
+    Exactly one thread, one Application, one run_polling() call.
     """
     thread = threading.Thread(target=_bot_worker, name="telegram-bot", daemon=True)
     thread.start()
     return thread
-
-
-def stop_bot() -> None:
-    """
-    Optionally request a graceful bot shutdown from another thread
-    (e.g. a SIGTERM handler in live.py). Thread-safe and a no-op if the bot
-    thread has already exited. Not required for normal operation.
-    """
-    loop, event = _bot_loop, _bot_stop_event
-    if loop is not None and event is not None and loop.is_running():
-        loop.call_soon_threadsafe(event.set)
 
 
 def get_bot_error() -> Optional[str]:
