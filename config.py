@@ -4,10 +4,9 @@ config.py — Central configuration for the Inline Whisper Bot.
 All secrets come from environment variables (see README.md). Nothing secret
 is hardcoded in this repository.
 
-Local development: put your variables in a `.env` file in the project root
-(see .env.example). It is loaded automatically if python-dotenv is installed.
-Real environment variables (e.g. set on the Render dashboard) ALWAYS take
-priority over the .env file.
+Local development: put your variables in a `.env` file in the project root.
+It is loaded automatically if python-dotenv is installed. Real environment
+variables (e.g. set on the Render dashboard) ALWAYS take priority.
 """
 
 import os
@@ -15,8 +14,6 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 
 # --- Optional .env support (local development) --------------------------------
-# load_dotenv() does NOT override variables that already exist in the real
-# environment, so Render dashboard values always win over a stray .env file.
 try:
     from dotenv import load_dotenv
 
@@ -97,6 +94,12 @@ def log_channel_problem() -> Optional[str]:
             "@username (e.g. @MyWhisperLogs) or a numeric chat ID."
         )
     return "LOG_CHANNEL is not set — whispers will NOT be logged to a channel."
+
+# --- Game (Telegram Mini App / Web App) ------------------------------------------
+
+# HTTPS URL of the game opened by the /game command's Mini App button.
+# Set on Render as an environment variable — never hardcoded.
+GAME_URL = os.getenv("GAME_URL", "").strip()
 
 # --- Tuning ------------------------------------------------------------------------
 
