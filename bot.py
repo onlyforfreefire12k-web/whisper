@@ -49,11 +49,15 @@ Whisper flow:
 6. Whispers expire after SESSION_TTL_SECONDS (15 minutes): expired or
    unknown cards answer "🔒 This whisper has expired." and never reveal text.
 
-7. LOG CHANNEL (LOG_CHANNEL config — @username or numeric ID; invite links
-   are rejected at startup): the moment the card is posted (ChosenInlineResult)
-   the COMPLETE whisper is logged — immediately and asynchronously
-   (Application.create_task, non-blocking). Failures NEVER break the whisper:
-   the full exception is printed via "WHISPER LOG SEND FAILED".
+7. LOG CHANNEL (LOG_CHANNEL config — @username or numeric ID): the moment
+   the whisper card is successfully created/posted (ChosenInlineResult — the
+   REAL creation path), the COMPLETE whisper is logged via the ONE
+   centralized send_whisper_log() function, called with a direct await.
+   - Exactly-once guarantee: the session 'logged' flag prevents duplicates.
+   - A deduped safety-net call exists in the 🔐 callback handler in case the
+     chosen-inline-result update was ever lost — still exactly one log.
+   - Failures NEVER break the whisper: the full exception is printed under
+     "WHISPER LOG SEND FAILED".
 
 Threading model (Render Web Service) — unchanged:
 
@@ -292,13 +296,12 @@ def build_reveal_dm(session: Dict[str, Any]) -> str:
 
 
 def build_log_text(session: Dict[str, Any]) -> str:
-    """Complete moderation log — sent ONLY to the private log channel."""
-    if session["target_type"] == "user_id":
-        target_type_label = "User ID"
-        target_id_line = str(session["target_user_id"])
-    else:
-        target_type_label = "Username"
-        target_id_line = "Unknown"
+    """Complete moderation log — sent ONLY to the private log channel.
+
+    Target is the EXACT string the sender entered: '@ObsessHolic' stays
+    '@ObsessHolic', '123456789' stays '123456789'. No resolution required.
+    """
+    target_type_label = "User ID" if session["target_type"] == "user_id" else "Username"
     return (
         "🕵️ <b>WHISPER LOG</b>\n\n"
         f"🆔 <b>Whisper ID:</b>\n#{html.escape(session['whisper_id'])}\n\n"
@@ -310,8 +313,6 @@ def build_log_text(session: Dict[str, Any]) -> str:
         f"{html.escape(session['target_display'])}\n\n"
         "<b>Target type:</b>\n"
         f"{target_type_label}\n\n"
-        "<b>Target ID:</b>\n"
-        f"{target_id_line}\n\n"
         "💬 <b>Whisper:</b>\n"
         f"{html.escape(session['text'])}\n\n"
         "🕐 <b>Time:</b>\n"
@@ -320,26 +321,31 @@ def build_log_text(session: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Audit log (best-effort — NEVER breaks whisper creation)
+# THE centralized whisper-log sender (exactly one function, exactly one log)
 # ---------------------------------------------------------------------------
 
-async def log_whisper(context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]) -> None:
+async def send_whisper_log(context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]) -> None:
     """
-    Send the complete whisper log to LOG_CHANNEL. Never raises.
+    THE centralized whisper-log sender. Called from the real whisper-creation
+    path (on_chosen_inline_result) the moment the card is posted into a chat.
 
-    Scheduled asynchronously (Application.create_task) by the caller the
-    moment the whisper card is posted, so whisper creation is never blocked.
-    On failure the FULL exception (with traceback) is printed to the Render
-    logs under "WHISPER LOG SEND FAILED"; the whisper itself is unaffected.
+    - Exactly-once: the session 'logged' flag guarantees a single whisper can
+      never generate two log messages, no matter how many times it's called.
+    - Never raises: a logging failure can never break a whisper.
+    - Failures print the FULL exception under "WHISPER LOG SEND FAILED".
     """
     wid = session["whisper_id"]
+
+    if session.get("logged"):
+        return  # Exactly-once guard — this whisper was already logged.
+
     if LOG_CHANNEL_DEST is None:
-        # Configuration problem (already reported loudly at startup) — still
-        # flag it per whisper so nothing is silently dropped.
-        logger.warning(
-            "Whisper #%s NOT logged — %s", wid, log_channel_problem()
-        )
+        logger.warning("Whisper #%s NOT logged — %s", wid, log_channel_problem())
         return
+
+    logger.info(
+        "Sending whisper log: whisper_id=%s target=%s", wid, session["target_display"]
+    )
     try:
         await context.bot.send_message(
             chat_id=LOG_CHANNEL_DEST,
@@ -347,9 +353,13 @@ async def log_whisper(context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any
             parse_mode=ParseMode.HTML,
         )
     except Exception:
-        # Covers Forbidden / chat not found / not enough rights / network —
-        # print the complete exception with traceback, never swallow it.
-        logger.exception("WHISPER LOG SEND FAILED for %s", wid)
+        # Forbidden / chat not found / network — full traceback in Render logs,
+        # never silently swallowed, and the whisper itself is unaffected.
+        logger.exception("WHISPER LOG SEND FAILED: whisper_id=%s", wid)
+        return  # 'logged' stays unset, so a retry remains possible.
+
+    session["logged"] = True
+    logger.info("Whisper log sent successfully: whisper_id=%s", wid)
 
 
 # ---------------------------------------------------------------------------
@@ -415,8 +425,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• A whisper needs text — up to {WHISPER_MAX_LENGTH} characters.\n"
         f"• Whispers expire after {SESSION_TTL_SECONDS // 60} minutes — expired cards "
         "show “🔒 This whisper has expired.”\n"
-        "• Every whisper is recorded in the bot's private log channel for moderation "
-        "and abuse reports."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -534,6 +542,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     register_user(context, user)
     prune_sessions(context)
 
+    # 1) Parse whisper text + 2) parse target.
     target_username, target_id, whisper_text = parse_inline_query(inline_query.query)
     whisper_text = (whisper_text or "").strip()
 
@@ -586,7 +595,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         target_username_norm = None
         target_user_id = int(target_id)
 
-    # --- Create the whisper session ------------------------------------------
+    # --- 3) Create unique whisper ID + 4) store whisper data -----------------
     wid = generate_whisper_id()
     now = time.time()
     session: Dict[str, Any] = {
@@ -603,9 +612,17 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "created_at": now,
         "expires_at": now + SESSION_TTL_SECONDS,
         "posted_at": None,
+        "logged": False,
     }
     get_sessions(context)[wid] = session
 
+    logger.info(
+        "Whisper prepared: whisper_id=%s target=%s", wid, session["target_display"]
+    )
+
+    # 5) Generate the public whisper card result (sent when the user taps it;
+    #    the actual logging happens in on_chosen_inline_result — the REAL
+    #    creation/success moment, exactly once).
     if target_type == "user_id":
         title = f"🔐 A whisper message to user ID {target_user_id}"
     else:
@@ -634,27 +651,37 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Fires the instant the sender posts the whisper card into a chat, i.e. the
-    moment the whisper is successfully created in the chat.
+    THE whisper-creation handler. Fires exactly when the sender taps the
+    inline result and the public whisper card is posted into the chat.
 
-    The complete whisper log is sent to LOG_CHANNEL IMMEDIATELY and
-    ASYNCHRONOUSLY (create_task) so the handler never blocks and a logging
-    failure can never break the whisper.
+    Order: parse text -> parse target -> create ID -> store data (all already
+    done in on_inline_query) -> card is SENT (this update) -> send whisper log.
+    The log call is a direct await here — the same pattern as the startup
+    test message that provably works.
     """
     chosen = update.chosen_inline_result
     if chosen is None:
         return
-    sessions = get_sessions(context)
-    session = sessions.get(chosen.result_id)
+
+    session = get_sessions(context).get(chosen.result_id)
     if session is None:
+        logger.warning(
+            "Chosen inline result for unknown whisper id=%s (expired or lost).",
+            chosen.result_id,
+        )
         return
-    if session.get("posted_at") is not None:
-        return  # Same whisper posted twice — log it only once.
 
-    session["status"] = "posted"
-    session["posted_at"] = time.time()
+    if session.get("posted_at") is None:
+        session["status"] = "posted"
+        session["posted_at"] = time.time()
+        logger.info(
+            "Whisper card posted to a chat: whisper_id=%s", session["whisper_id"]
+        )
 
-    context.application.create_task(log_whisper(context, session))
+    # 6) THE log call — directly in the successful whisper-creation path.
+    await send_whisper_log(context, session)
+    # 7) Success — the card is in the chat and the log has been sent (or its
+    #    failure was fully printed without breaking the whisper).
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +761,12 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         sessions.pop(wid, None)
         await _safe_answer(query, "🔒 This whisper has expired.")
         return
+
+    # LOG SAFETY NET (exactly-once, deduped inside send_whisper_log):
+    # normally the log was already sent in on_chosen_inline_result the moment
+    # the card was posted. If that update was ever lost, the first button
+    # press proves the card exists in a chat — send the log NOW, once.
+    await send_whisper_log(context, session)
 
     # SECURITY: the ONE authorization rule — based ONLY on the stored target
     # (exact user ID, or the presser's current Telegram username). The sender
@@ -823,7 +856,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("game", cmd_game))
     application.add_handler(InlineQueryHandler(on_inline_query))
-    # Fires the moment the card is posted -> immediate async log to channel.
+    # THE whisper-creation path: fires the moment the card is posted -> log.
     application.add_handler(ChosenInlineResultHandler(on_chosen_inline_result))
     application.add_handler(CallbackQueryHandler(on_callback_query, pattern=r"^whisper:"))
     application.add_handler(
@@ -862,7 +895,7 @@ def run_bot() -> None:
     application = build_application()
     try:
         application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
+            allowed_updates=Update.ALL_TYPES,  # includes chosen_inline_result!
             drop_pending_updates=True,
             close_loop=False,   # _bot_worker() owns and closes the loop itself.
             stop_signals=None,  # CRITICAL: no SIGINT/SIGTERM handlers on this
