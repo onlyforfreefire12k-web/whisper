@@ -24,13 +24,24 @@ Whisper flow (100% Telegram-native — no fake "invisible messages"):
 Result: the whisper text is only ever visible to the sender (DM), the
 recipient (DM) and the authorized log channel — never in the group chat.
 
-The deployment entry point is live.py (Flask + bot thread).
+Threading model (Render Web Service):
+
+    python live.py
+        ├── Telegram bot -> daemon background thread (start_bot_thread)
+        └── Flask        -> main thread (live.py)
+
+Python 3.10+/3.12 do NOT create an asyncio event loop automatically for
+non-main threads, and Application.run_polling() calls
+asyncio.get_event_loop() internally. _bot_worker() therefore creates and
+installs an event loop for its thread EXPLICITLY before starting the bot.
 """
 
+import asyncio
 import html
 import logging
 import re
 import secrets
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -812,10 +823,10 @@ def build_application() -> Application:
 
 def run_bot() -> None:
     """
-    Build the bot application and start long polling.
+    Build the Telegram application and start long polling.
 
-    Blocks the calling thread (live.py runs this in a background thread so
-    the Flask web server stays responsive).
+    Blocks the calling thread — start_bot_thread() runs this in a background
+    thread so the Flask web server (main thread in live.py) stays responsive.
     """
     if not BOT_TOKEN:
         logger.critical(
@@ -842,3 +853,66 @@ def run_bot() -> None:
     except TelegramError as exc:
         logger.critical("Telegram bot stopped with an API error: %s", exc)
     logger.info("Telegram bot polling stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Background-thread startup (Python 3.10+/3.12 event-loop fix)
+# ---------------------------------------------------------------------------
+
+# Last fatal error of the bot thread (surfaced by Flask's /health endpoint).
+_bot_error: Optional[str] = None
+
+
+def _bot_worker() -> None:
+    """
+    Thread target that runs the Telegram bot.
+
+    Python 3.10+ (and especially 3.12) no longer creates an asyncio event
+    loop automatically for non-main threads, and Application.run_polling()
+    calls asyncio.get_event_loop() internally. Without a loop installed for
+    THIS thread, that call raises:
+
+        RuntimeError: There is no current event loop in thread 'telegram-bot'
+
+    We therefore explicitly create and install an event loop for this thread
+    BEFORE starting the bot, and close it again when the bot stops.
+    """
+    global _bot_error
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        run_bot()
+    except Exception as exc:
+        # Never let the thread die silently — /health reports this error.
+        _bot_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("Telegram bot thread crashed!")
+    finally:
+        # run_polling() does not necessarily close the loop it used.
+        # close() is safe even if the loop is already closed.
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def start_bot_thread() -> threading.Thread:
+    """
+    Start the Telegram bot in a daemon background thread and return the thread.
+
+    Called by live.py BEFORE Flask starts, so the architecture stays:
+
+        python live.py
+            ├── Telegram bot  -> background thread (own asyncio event loop)
+            └── Flask         -> main thread
+
+    Exactly one thread, one Application, one run_polling() call.
+    """
+    thread = threading.Thread(target=_bot_worker, name="telegram-bot", daemon=True)
+    thread.start()
+    return thread
+
+
+def get_bot_error() -> Optional[str]:
+    """Return the bot thread's last fatal error (None if the bot is healthy)."""
+    return _bot_error
