@@ -10,6 +10,9 @@ Runs two components side by side without blocking each other:
 
   2. Telegram bot (daemon background thread)
        Long polling via python-telegram-bot; all logic in bot.py.
+       The thread's asyncio event loop is created explicitly inside
+       bot.start_bot_thread() — required on Python 3.10+/3.12, which no
+       longer auto-creates event loops for non-main threads.
 
 Render Start Command:
 
@@ -27,7 +30,7 @@ from typing import Optional
 
 from flask import Flask, jsonify
 
-from bot import run_bot
+from bot import get_bot_error, start_bot_thread
 from config import PORT, config_warnings
 
 # ---------------------------------------------------------------------------
@@ -47,17 +50,6 @@ logger = logging.getLogger("live")
 app = Flask(__name__)
 
 _bot_thread: Optional[threading.Thread] = None
-_bot_error: Optional[str] = None
-
-
-def _bot_worker() -> None:
-    """Runs the Telegram bot in this background thread until it stops."""
-    global _bot_error
-    try:
-        run_bot()
-    except Exception as exc:  # Never let the thread die silently.
-        _bot_error = f"{type(exc).__name__}: {exc}"
-        logger.exception("Telegram bot thread crashed!")
 
 
 @app.get("/")
@@ -74,8 +66,9 @@ def health() -> tuple:
         "bot": "running" if bot_alive else "stopped",
         "time": datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC"),
     }
-    if _bot_error:
-        payload["bot_error"] = _bot_error
+    bot_error = get_bot_error()
+    if bot_error:
+        payload["bot_error"] = bot_error
     return jsonify(payload), 200
 
 
@@ -91,10 +84,11 @@ def main() -> None:
         logger.warning("%s", warning)
 
     # 1) Telegram bot in a background thread (daemon -> dies with the process).
-    #    run_polling() creates its own asyncio event loop inside this thread,
-    #    so it does not interfere with Flask in the main thread.
-    _bot_thread = threading.Thread(target=_bot_worker, name="telegram-bot", daemon=True)
-    _bot_thread.start()
+    #    start_bot_thread() creates and installs the thread's asyncio event
+    #    loop explicitly (Python 3.10+/3.12 do not do this automatically for
+    #    non-main threads) and then starts long polling. Flask in the main
+    #    thread is never blocked, and polling never blocks Flask.
+    _bot_thread = start_bot_thread()
     logger.info("Telegram bot thread started.")
 
     # 2) Flask web server in the main thread (blocks until shutdown).
