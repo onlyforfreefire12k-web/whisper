@@ -27,6 +27,19 @@ except ImportError:
 # Bot token from @BotFather. Required for the Telegram bot to run.
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 
+# --- Owners (owner-only auth management) ------------------------------------------
+# Comma- or space-separated Telegram user IDs that OWN the bot. Owners are the
+# only ones who may manage the trusted auth list via /addauth and /rauth.
+# Owners always keep owner rights and can never be removed with /rauth.
+#
+#   OWNER_IDS=123456789,987654321
+#
+OWNER_IDS: list = []
+for _part in os.getenv("OWNER_IDS", "").replace(";", ",").replace(" ", ",").split(","):
+    _part = _part.strip()
+    if _part and _part.lstrip("-").isdigit():
+        OWNER_IDS.append(int(_part))
+
 # --- Log channel destination ------------------------------------------------------
 # LOG_CHANNEL is THE destination for whisper logs. It accepts:
 #
@@ -123,6 +136,11 @@ def config_warnings() -> list:
         warnings.append(
             "BOT_TOKEN is not set. The Telegram bot cannot start. "
             "Set it in your .env file or environment."
+        )
+    if not OWNER_IDS:
+        warnings.append(
+            "OWNER_IDS is not set. Nobody will be able to use /addauth or /rauth "
+            "(and therefore nobody can manage /gmute)."
         )
     problem = log_channel_problem()
     if problem:
