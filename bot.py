@@ -1,46 +1,45 @@
 """
-bot.py — Whispry: Inline Whisper Bot with secure MEDIA WHISPERS.
+bot.py — Whispry: Inline Whisper Bot with secure MEDIA WHISPERS,
+GLOBAL GMUTE, owner-only auth management, and recent-recipient suggestions.
 
 TEXT WHISPER FLOW (unchanged):
     @BotName <whisper text> @TargetUsername
     @BotName <whisper text> 123456789
 -> locked text-only card + 🔐 button; verified target only; 15-min TTL.
 
-MEDIA WHISPER FLOW (new):
-1. The sender sends a photo / video / document (optional caption) to the
-   bot's PRIVATE chat. The bot stores ONLY the Telegram file_id /
-   file_unique_id + type + caption as "pending media" for that sender
-   (no downloads, no database, no public URLs).
-2. The sender then types @BotName <text> <target> in any chat. While
-   pending media exists, the inline query returns EXACTLY six results —
-   one per view mode: NORMAL, 3s, 5s, 10s, 30s, ONCE VIEW. Each inline
-   result id encodes the mode: "<whisper_id>|<mode>".
-3. The public card stays the secure TEXT-ONLY card — the actual media is
-   NEVER placed in the public message, in callback_data, or in any URL.
-4. When the verified target presses 🔐 (same is_target_user() rule as
-   text whispers), the media + caption are delivered to THEIR private
-   bot chat (their own user id from the callback query — never to the
-   chat at large):
-       - NORMAL        -> delivered normally, repeatable until TTL expiry.
-       - 3/5/10/30s    -> deleted automatically N seconds after delivery;
-                          the whisper is consumed (one delivery only).
-       - ONCE          -> consumed immediately and deleted after a short
-                          platform-permitted grace window (bots cannot
-                          detect actual media "views", so delivery itself
-                          is the single viewing opportunity).
-       Re-pressing a consumed media whisper answers:
-       "🔒 This media whisper has expired or has already been viewed."
-5. If the target has never started the bot, the DM fails (Forbidden):
-   NOTHING is revealed; the card gains a "▶️ Start Whispry" deep-link
-   button (t.me/<bot>?start=m<whisper_id>). After starting, the bot
-   re-verifies the recipient (user ID or current @username) and then
-   delivers the pending media privately.
-6. LOG CHANNEL: the existing ChosenInlineResult-based, exactly-once
-   send_whisper_log() sends the full text log (now including view mode,
-   media type and caption) AND the EXACT original media (photo/video/
-   document) to LOG_CHANNEL. Attachment failures are printed to the
-   Render logs under "MEDIA WHISPER LOG FAILED" and never break the
-   whisper flow.
+MEDIA WHISPER FLOW (unchanged):
+1. Sender sends a photo/video/document to the bot's PRIVATE chat -> stored as
+   Telegram file_id/file_unique_id ONLY ("pending media").
+2. @BotName <text> <target> returns six results (NORMAL, 3s, 5s, 10s, 30s,
+   ONCE). Public card stays text-only; media is delivered ONLY to the
+   verified target's private chat when they press 🔐.
+3. If the target never started the bot: nothing is revealed; the card gains
+   a "▶️ Start Whispry" deep-link; after /start the target is re-verified
+   and the pending media is delivered.
+
+RECENT RECIPIENTS (new — an ADDITION, not a replacement):
+* Every successful whisper (manual or suggested) records the recipient in
+  the SENDER's private history (recipient_history.json, per-sender, capped).
+* When the inline query has NO explicit target, the picker shows the
+  sender's recent recipients as tappable results ("🔐 A whisper message to
+  Ayaan") plus a "➕ New recipient" entry — never another user's history.
+* A tapped suggestion creates a real whisper session targeting that stored
+  recipient (user ID preferred), flowing through the SAME chosen-inline
+  logging, media modes and 🔐 verification as manual input.
+* With pending media, the top suggestions each offer the six view modes.
+
+GLOBAL GMUTE (new):
+* /gmute <user_id>  (owner or trusted auth list) — the user's messages are
+  auto-deleted in every group where the bot is a member with delete rights,
+  until /gunmute <user_id>. Persisted in gmute_users.json.
+* Chats where deletion fails (missing rights) are remembered for the
+  process lifetime to avoid futile API calls; failures are logged, never fatal.
+
+OWNER-ONLY AUTH (new):
+* OWNER_IDS (config) are the bot owners. Only owners may /addauth and
+  /rauth (auth_users.json). Owners can never be removed via /rauth.
+* The trusted list (owners ∪ auth users) gates /gmute and /gunmute.
+  Ordinary Telegram group admins get nothing automatically.
 
 Threading model (Render Web Service) — unchanged:
 
@@ -64,7 +63,7 @@ import secrets
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import (
     BotCommand,
@@ -90,10 +89,12 @@ from telegram.ext import (
     filters,
 )
 
+import storage
 from config import (
     BOT_TOKEN,
     GAME_URL,
     LOG_CHANNEL_DEST,
+    OWNER_IDS,
     SESSION_TTL_SECONDS,
     WHISPER_MAX_LENGTH,
     log_channel_problem,
@@ -126,8 +127,7 @@ MEDIA_VIEW_DELETE_DELAYS: Dict[str, int] = {"3s": 3, "5s": 5, "10s": 10, "30s": 
 
 # ONCE VIEW: bots cannot detect when a user actually "views" media, so the
 # single viewing opportunity is the delivery itself. The whisper is consumed
-# immediately and the message is deleted after this short grace window —
-# the closest Telegram-native behaviour to "view once".
+# immediately and the message is deleted after this short grace window.
 ONCE_VIEW_DELETE_DELAY_SECONDS = 2
 
 MEDIA_VIEW_LABELS: Dict[str, str] = {
@@ -160,6 +160,31 @@ MEDIA_ICONS: Dict[str, str] = {"photo": "🖼 Photo", "video": "🎬 Video", "do
 MAX_MEDIA_CAPTION_CHARS = 1000
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,64}$")
+
+# --- Persistent stores (JSON files; loaded once, saved on every change) ------
+GMUTE_FILE = "gmute_users.json"
+AUTH_FILE = "auth_users.json"
+HISTORY_FILE = "recipient_history.json"
+
+_gmute_raw = storage.load_json(GMUTE_FILE, [])
+GMUTE_USERS: set = {int(x) for x in _gmute_raw} if isinstance(_gmute_raw, list) else set()
+
+_auth_raw = storage.load_json(AUTH_FILE, [])
+AUTH_USERS: set = {int(x) for x in _auth_raw} if isinstance(_auth_raw, list) else set()
+
+_history_raw = storage.load_json(HISTORY_FILE, {})
+RECIPIENT_HISTORY: Dict[str, List[Dict[str, Any]]] = (
+    _history_raw if isinstance(_history_raw, dict) else {}
+)
+
+# Per-sender recipient history limits ("recent/frequent", most recent first).
+HISTORY_LIMIT = 15                      # stored recipients per sender
+RECIPIENT_SUGGESTION_LIMIT = 8          # suggestions shown (no media pending)
+RECIPIENT_SUGGESTION_MEDIA_LIMIT = 3    # recipients shown with media (x6 modes)
+
+# Group chats where a mute-deletion failed (missing rights) — skip retries
+# until restart so we never hammer the API in chats we can't moderate in.
+_gmute_failed_chats: set = set()
 
 _used_whisper_ids: set = set()
 
@@ -221,7 +246,7 @@ def parse_inline_query(raw: str) -> Tuple[Optional[str], Optional[int], str]:
       - '@Username'  -> returned as (username_as_typed, None, text)
       - '123456789'  -> returned as (None, 123456789, text)
     If the last token is neither, the whole query is treated as text with no
-    target (the caller then shows the format hint).
+    target (the caller may then show recipient suggestions / the format hint).
     """
     text = (raw or "").strip()
     if not text:
@@ -301,6 +326,83 @@ def is_target_user(session: Dict[str, Any], user: Any) -> bool:
         return user.id == session["target_user_id"]
     presser = normalize_username(getattr(user, "username", None))
     return bool(presser) and presser == session["target_username"]
+
+
+# ---------------------------------------------------------------------------
+# Owner / trusted-auth checks (FEATURE: owner-only auth + gmute)
+# ---------------------------------------------------------------------------
+
+def is_owner(user_id: int) -> bool:
+    """Bot owners (config.OWNER_IDS). Cannot be removed via /rauth."""
+    return user_id in OWNER_IDS
+
+
+def is_authorized(user_id: int) -> bool:
+    """Owners plus the persisted trusted/auth list — gates /gmute and /gunmute."""
+    return is_owner(user_id) or user_id in AUTH_USERS
+
+
+def _persist_gmute() -> None:
+    if not storage.save_json(GMUTE_FILE, sorted(GMUTE_USERS)):
+        logger.error("Failed to save %s — mute change is in memory only.", GMUTE_FILE)
+
+
+def _persist_auth() -> None:
+    if not storage.save_json(AUTH_FILE, sorted(AUTH_USERS)):
+        logger.error("Failed to save %s — auth change is in memory only.", AUTH_FILE)
+
+
+def _persist_history() -> None:
+    if not storage.save_json(HISTORY_FILE, RECIPIENT_HISTORY):
+        logger.error("Failed to save %s — history change is in memory only.", HISTORY_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Recent-recipient history (per sender, private, persisted)
+# ---------------------------------------------------------------------------
+
+def _recipient_key(entry: Dict[str, Any]) -> str:
+    """Stable identity of a stored recipient (never user-typed free text)."""
+    if entry.get("target_type") == "user_id":
+        return f"u{entry.get('user_id')}"
+    return "@" + (entry.get("username") or "")
+
+
+def _history_display(context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]) -> str:
+    """Friendly display for the suggestion title ('Ayaan', '@Rahul', 'user ID 123')."""
+    if session["target_type"] == "user_id":
+        known = get_users(context).get(str(session.get("target_user_id")))
+        if known and known.get("name"):
+            return str(known["name"])
+        return f"user ID {session.get('target_user_id')}"
+    return session["target_display"]  # '@Username' exactly as typed
+
+
+def remember_recipient(
+    context: ContextTypes.DEFAULT_TYPE, sender_id: int, session: Dict[str, Any]
+) -> None:
+    """
+    Record/update the recipient in the SENDER's private history.
+
+    Called from the successful whisper-creation path (ChosenInlineResult) for
+    BOTH manual and suggestion-selected recipients, so positions update on
+    every successful use. Never raises; persistence failures are logged.
+    """
+    try:
+        entry = {
+            "target_type": session["target_type"],
+            "user_id": session.get("target_user_id"),
+            "username": session.get("target_username"),
+            "display": _history_display(context, session),
+        }
+        key = _recipient_key(entry)
+        hist = RECIPIENT_HISTORY.setdefault(str(sender_id), [])
+        hist[:] = [e for e in hist if _recipient_key(e) != key]
+        hist.insert(0, entry)
+        del hist[HISTORY_LIMIT:]  # cap the stored history
+        _persist_history()
+    except Exception:
+        logger.exception("Failed to record recipient history for sender %s", sender_id)
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +685,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "4️⃣ Only the target can open it with 🔐 — verified by their Telegram "
         "account (user ID, or their current @username). Everyone else — "
         "including the sender — sees “❌ This whisper isn't for you.”\n\n"
+        "🕐 <b>Recent recipients</b> — after you've whispered to someone, they "
+        "appear as tappable suggestions whenever you don't type a target.\n\n"
         "🖼 <b>Media whispers</b> — send a photo, video or file to my private "
         "chat first, then whisper as usual (see /help).\n\n"
         "ℹ️ The whisper text is never shown in the chat.\n\n"
@@ -665,6 +769,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "comes LAST.\n"
         f"• Or use a numeric Telegram user ID: <code>@{bot_username} your message "
         "123456789</code>.\n"
+        "• Recent recipients appear as tappable suggestions whenever you don't type "
+        "a target — tap one to target them instantly, or pick “➕ New recipient”.\n"
         "• The target does NOT need to have started the bot — the whisper card is "
         "posted in the chat and they unlock it with the 🔐 button.\n"
         "• The whisper text is never shown in the chat.\n\n"
@@ -675,7 +781,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "six results:\n"
         "    🔓 Normal · ⏳ 3s · ⏳ 5s · ⏳ 10s · ⏳ 30s · 👁 Once view\n"
         "3️⃣ Tap one — the locked card is posted; the media is delivered only to "
-        "the target's private chat when they press 🔐.\n"
+        "the target's private chat when they press 🔐. Recent recipients work here "
+        "too.\n"
         "• Timed and once-view media are deleted automatically after delivery and "
         "can be opened only once.\n"
         "• If the target hasn't started me yet, they'll get a ▶️ Start Whispry "
@@ -747,7 +854,224 @@ async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Private chat — media intake for MEDIA WHISPERS
+# FEATURE: Global GMUTE — persistent, owner/auth-gated
+# ---------------------------------------------------------------------------
+
+def _parse_user_id_arg(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Parse '/command <user_id>' — numeric only; None if missing/invalid."""
+    if not context.args:
+        return None
+    raw = context.args[0].strip()
+    return int(raw) if raw.isdigit() else None
+
+
+async def cmd_gmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Globally mute a user by Telegram ID (owner or trusted auth list only)."""
+    if update.message is None:
+        return
+    user = update.effective_user
+    if user is not None:
+        register_user(context, user)
+    if user is None or not is_authorized(user.id):
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    target = _parse_user_id_arg(context)
+    if target is None:
+        await update.message.reply_text(
+            "Usage: <code>/gmute 123456789</code>\n"
+            "Globally mutes the user — their messages will be deleted in every "
+            "group where I am a member with delete permission.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if target in GMUTE_USERS:
+        await update.message.reply_text(
+            f"🔇 User <code>{target}</code> is already globally muted.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    GMUTE_USERS.add(target)
+    _persist_gmute()
+    logger.info("GMUTE ADDED: user=%s by=%s", target, user.id)
+    await update.message.reply_text(
+        f"🔇 User <code>{target}</code> is now <b>globally muted</b>.\n"
+        "Their messages will be deleted automatically in every group where I "
+        "have permission. Use /gunmute to undo.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_gunmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a user from the global mute list (owner or trusted auth list only)."""
+    if update.message is None:
+        return
+    user = update.effective_user
+    if user is not None:
+        register_user(context, user)
+    if user is None or not is_authorized(user.id):
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+
+    target = _parse_user_id_arg(context)
+    if target is None:
+        await update.message.reply_text(
+            "Usage: <code>/gunmute 123456789</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if target not in GMUTE_USERS:
+        await update.message.reply_text(
+            f"ℹ️ User <code>{target}</code> is not globally muted.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    GMUTE_USERS.discard(target)
+    _persist_gmute()
+    logger.info("GMUTE REMOVED: user=%s by=%s", target, user.id)
+    await update.message.reply_text(
+        f"🔊 User <code>{target}</code> has been <b>unmuted globally</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fast-path for GLOBAL GMUTE: delete every new group message from a
+    globally muted user. Normal messages are untouched (this returns
+    immediately unless the sender is muted).
+    """
+    message = update.message
+    if message is None:
+        return
+    sender = message.from_user
+    if sender is None or sender.id not in GMUTE_USERS:
+        return
+    if message.chat.id in _gmute_failed_chats:
+        return  # We already know we lack delete rights in this chat.
+
+    try:
+        await context.bot.delete_message(
+            chat_id=message.chat.id, message_id=message.message_id
+        )
+        logger.info(
+            "GMUTE MESSAGE DELETED: user=%s chat=%s", sender.id, message.chat.id
+        )
+    except Forbidden as exc:
+        # No delete permission here — remember it so we stop retrying.
+        _gmute_failed_chats.add(message.chat.id)
+        logger.warning(
+            "GMUTE: cannot delete messages in chat %s (missing permission) — "
+            "skipping this chat until restart. Error: %s",
+            message.chat.id, exc,
+        )
+    except BadRequest as exc:
+        # Could be transient (e.g. already deleted) — log, keep trying later.
+        logger.warning(
+            "GMUTE: delete failed in chat %s: %s", message.chat.id, exc
+        )
+    except TelegramError as exc:
+        logger.error(
+            "GMUTE: Telegram error deleting message in chat %s: %s",
+            message.chat.id, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# FEATURE: Owner-only trusted-auth management
+# ---------------------------------------------------------------------------
+
+async def cmd_addauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a user to the trusted/auth list — OWNER_IDS only."""
+    if update.message is None:
+        return
+    user = update.effective_user
+    if user is not None:
+        register_user(context, user)
+    if user is None or not is_owner(user.id):
+        await update.message.reply_text(
+            "❌ Only the bot owner can manage the trusted list."
+        )
+        return
+
+    target = _parse_user_id_arg(context)
+    if target is None:
+        await update.message.reply_text(
+            "Usage: <code>/addauth 123456789</code>\n"
+            "Adds the user to the trusted list (may then use /gmute and /gunmute).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if target in OWNER_IDS:
+        await update.message.reply_text(
+            f"ℹ️ User <code>{target}</code> is an owner — always authorized.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if target in AUTH_USERS:
+        await update.message.reply_text(
+            f"ℹ️ User <code>{target}</code> is already on the trusted list.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    AUTH_USERS.add(target)
+    _persist_auth()
+    logger.info("AUTH ADDED: user=%s by=%s", target, user.id)
+    await update.message.reply_text(
+        f"✅ User <code>{target}</code> added to the <b>trusted list</b> "
+        "(may now use /gmute and /gunmute).",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_rauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a user from the trusted/auth list — OWNER_IDS only, owners immune."""
+    if update.message is None:
+        return
+    user = update.effective_user
+    if user is not None:
+        register_user(context, user)
+    if user is None or not is_owner(user.id):
+        await update.message.reply_text(
+            "❌ Only the bot owner can manage the trusted list."
+        )
+        return
+
+    target = _parse_user_id_arg(context)
+    if target is None:
+        await update.message.reply_text(
+            "Usage: <code>/rauth 123456789</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if target in OWNER_IDS:
+        await update.message.reply_text(
+            f"🛡 User <code>{target}</code> is an owner — owners can never be "
+            "removed with /rauth.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if target not in AUTH_USERS:
+        await update.message.reply_text(
+            f"ℹ️ User <code>{target}</code> is not on the trusted list.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    AUTH_USERS.discard(target)
+    _persist_auth()
+    logger.info("AUTH REMOVED: user=%s by=%s", target, user.id)
+    await update.message.reply_text(
+        f"✅ User <code>{target}</code> removed from the <b>trusted list</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Private chat — media intake for MEDIA WHISPERS (unchanged)
 # ---------------------------------------------------------------------------
 
 async def on_private_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -810,7 +1134,7 @@ async def on_private_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "2️⃣ Pick a view mode:\n"
         "    🔓 Normal · ⏳ 3s · ⏳ 5s · ⏳ 10s · ⏳ 30s · 👁 Once view\n"
         "3️⃣ Tap the result — the locked card is posted and only the target can "
-        "open the media with 🔐.\n\n"
+        "open the media with 🔐. Recent recipients work here too.\n\n"
         "ℹ️ The media is delivered only to the target's private chat — never "
         "into the public chat. Send another photo/video/file to replace this one.",
         parse_mode=ParseMode.HTML,
@@ -818,7 +1142,7 @@ async def on_private_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ---------------------------------------------------------------------------
-# Inline mode — whisper creation
+# Inline mode — whisper creation (+ recent-recipient suggestions)
 # ---------------------------------------------------------------------------
 
 def _format_hint_result(context: ContextTypes.DEFAULT_TYPE) -> InlineQueryResultArticle:
@@ -873,6 +1197,172 @@ def _bot_target_result() -> InlineQueryResultArticle:
     )
 
 
+def _new_recipient_result(context: ContextTypes.DEFAULT_TYPE) -> InlineQueryResultArticle:
+    """The permanent '➕ New recipient' option (keeps the manual syntax alive)."""
+    bot_username = context.bot.username
+    return InlineQueryResultArticle(
+        id="newrecip-" + secrets.token_hex(4),
+        title="➕ New recipient",
+        description="Type your message + @username or user ID",
+        input_message_content=InputTextMessageContent(
+            message_text=(
+                "➕ <b>New recipient</b>\n\n"
+                "Type the recipient as the LAST token — a @username or a Telegram "
+                "user ID:\n"
+                f"<code>@{bot_username} your secret message @username</code>\n"
+                f"<code>@{bot_username} your secret message 123456789</code>\n\n"
+                "You never need to save a recipient first — typing a target always "
+                "works. 🤫"
+            ),
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+
+
+def create_whisper_session(
+    context: ContextTypes.DEFAULT_TYPE,
+    user: Any,
+    whisper_text: str,
+    target_type: str,
+    target_display: str,
+    target_username_norm: Optional[str],
+    target_user_id: Optional[int],
+    media: Optional[Dict[str, Any]] = None,
+    media_caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create + store a whisper session (the single session factory used by the
+    manual inline path AND the recent-recipient suggestion path).
+    """
+    wid = generate_whisper_id()
+    now = time.time()
+    session: Dict[str, Any] = {
+        "whisper_id": wid,
+        "sender_id": user.id,
+        "sender_name": user.first_name or user.full_name or "Unknown",
+        "sender_username": user.username,
+        "target_type": target_type,            # "username" | "user_id"
+        "target_display": target_display,      # exact target string for the card
+        "target_username": target_username_norm,  # normalized, username targets only
+        "target_user_id": target_user_id,      # numeric targets only
+        "text": whisper_text,
+        "status": "created",
+        "created_at": now,
+        "expires_at": now + SESSION_TTL_SECONDS,
+        "posted_at": None,
+        "logged": False,
+        "media": media,           # {"type","file_id","file_unique_id"} or None
+        "media_caption": media_caption,
+        "view_mode": None,        # set on selection: normal/3s/5s/10s/30s/once
+        "delivery_state": None,   # None | "delivered" | "consumed"
+    }
+    get_sessions(context)[wid] = session
+    return session
+
+
+def build_inline_result(
+    session: Dict[str, Any],
+    title: str,
+    description: str,
+    mode: Optional[str] = None,
+) -> InlineQueryResultArticle:
+    """
+    The single inline-result factory: secure text-only card + 🔐 button whose
+    callback_data contains ONLY the whisper ID ("whisper:W-XXXXXX"). The mode
+    is encoded in the result id ("<wid>|<mode>") for media view-mode choices.
+    """
+    rid = f"{session['whisper_id']}|{mode}" if mode else session["whisper_id"]
+    return InlineQueryResultArticle(
+        id=rid,
+        title=title,
+        description=description,
+        input_message_content=InputTextMessageContent(
+            message_text=build_whisper_card(session), parse_mode=ParseMode.HTML
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text="🔐", callback_data=f"whisper:{session['whisper_id']}")]]
+        ),
+    )
+
+
+def _build_recipient_results(
+    context: ContextTypes.DEFAULT_TYPE, user: Any, whisper_text: str
+) -> Optional[List[InlineQueryResultArticle]]:
+    """
+    Recent-recipient suggestions for THIS sender only (never anyone else's).
+
+    Each suggestion is a REAL whisper session created at query time, so the
+    tapped result flows through the existing chosen-inline pipeline (posting,
+    logging, media modes, 🔐 verification) unchanged. Result ids reference
+    only sessions we just created for this user — nothing user-controlled is
+    ever trusted as the recipient identity.
+
+    Returns None when the sender has no history (caller falls back to the
+    format hint).
+    """
+    entries = RECIPIENT_HISTORY.get(str(user.id)) or []
+    if not entries:
+        return None
+
+    pending = get_pending_media(context).get(str(user.id))
+    results: List[InlineQueryResultArticle] = []
+
+    if pending:
+        # Media pending: top recipients x the six view modes.
+        media = {
+            "type": pending["type"],
+            "file_id": pending["file_id"],
+            "file_unique_id": pending["file_unique_id"],
+        }
+        for entry in entries[:RECIPIENT_SUGGESTION_MEDIA_LIMIT]:
+            if entry.get("target_type") == "user_id":
+                session = create_whisper_session(
+                    context, user, whisper_text, "user_id",
+                    str(entry.get("user_id")), None, entry.get("user_id"),
+                    media=media, media_caption=pending.get("caption"),
+                )
+            else:
+                uname = entry.get("username") or ""
+                session = create_whisper_session(
+                    context, user, whisper_text, "username",
+                    "@" + uname, uname, None,
+                    media=media, media_caption=pending.get("caption"),
+                )
+            for mode in MEDIA_VIEW_MODES:
+                results.append(
+                    build_inline_result(
+                        session,
+                        title=f"{MEDIA_RESULT_TITLES[mode]} — to {entry.get('display', session['target_display'])}",
+                        description="Only the target can open it with 🔐",
+                        mode=mode,
+                    )
+                )
+    else:
+        for entry in entries[:RECIPIENT_SUGGESTION_LIMIT]:
+            plain = entry.get("display") or "?"
+            if entry.get("target_type") == "user_id":
+                session = create_whisper_session(
+                    context, user, whisper_text, "user_id",
+                    str(entry.get("user_id")), None, entry.get("user_id"),
+                )
+            else:
+                uname = entry.get("username") or ""
+                session = create_whisper_session(
+                    context, user, whisper_text, "username",
+                    "@" + uname, uname, None,
+                )
+            results.append(
+                build_inline_result(
+                    session,
+                    title=f"🔐 A whisper message to {plain}",
+                    description=f"Only {plain} can open this whisper — tap to post",
+                )
+            )
+
+    results.append(_new_recipient_result(context))
+    return results
+
+
 async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     inline_query = update.inline_query
     if inline_query is None:
@@ -883,12 +1373,12 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     register_user(context, user)
     prune_sessions(context)
 
-    # 1) Parse whisper text + 2) parse target.
+    # 1) Parse whisper text + 2) parse target (manual syntax — unchanged).
     target_username, target_id, whisper_text = parse_inline_query(inline_query.query)
     whisper_text = (whisper_text or "").strip()
 
-    # Missing recipient or empty whisper -> friendly format hint.
-    if (target_username is None and target_id is None) or not whisper_text:
+    # Empty whisper -> friendly format hint (unchanged).
+    if not whisper_text:
         try:
             await inline_query.answer(
                 results=[_format_hint_result(context)], cache_time=1, is_personal=True
@@ -897,7 +1387,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error("Failed to answer inline query: %s", exc)
         return
 
-    # Whisper that is too long -> hint as well.
+    # Whisper that is too long -> hint as well (unchanged).
     if len(whisper_text) > WHISPER_MAX_LENGTH:
         try:
             await inline_query.answer(
@@ -907,7 +1397,38 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error("Failed to answer inline query: %s", exc)
         return
 
-    # --- Store the target EXACTLY as entered (no resolution of any kind) ----
+    # --- NO explicit target -> recent/frequent recipient suggestions ---------
+    # (An ADDITION: manual '@username' / numeric-ID targeting below is
+    # untouched and takes priority whenever a target IS typed.)
+    if target_username is None and target_id is None:
+        suggestion_results = _build_recipient_results(context, user, whisper_text)
+        if suggestion_results:
+            logger.info(
+                "INLINE RECIPIENT SUGGESTIONS: user=%s count=%d",
+                user.id, len(suggestion_results),
+            )
+            try:
+                await inline_query.answer(
+                    results=suggestion_results, cache_time=0, is_personal=True
+                )
+            except TelegramError as exc:
+                logger.error("Failed to answer inline query: %s", exc)
+                try:
+                    await inline_query.answer(results=[], cache_time=5)
+                except TelegramError:
+                    pass
+            return
+        # No history yet -> existing format hint.
+        try:
+            await inline_query.answer(
+                results=[_format_hint_result(context)], cache_time=1, is_personal=True
+            )
+        except TelegramError as exc:
+            logger.error("Failed to answer inline query: %s", exc)
+        return
+
+    # --- Manual target path (existing flow, unchanged) ------------------------
+    # Store the target EXACTLY as entered (no resolution of any kind).
     if target_username is not None:
         # Local comparison against the bot's own username only (no Bot API call).
         if normalize_username(target_username) == (context.bot.username or "").lower():
@@ -936,92 +1457,57 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         target_username_norm = None
         target_user_id = int(target_id)
 
-    # --- 3) Create unique whisper ID + 4) store whisper data -----------------
-    wid = generate_whisper_id()
-    now = time.time()
-    session: Dict[str, Any] = {
-        "whisper_id": wid,
-        "sender_id": user.id,
-        "sender_name": user.first_name or user.full_name or "Unknown",
-        "sender_username": user.username,
-        "target_type": target_type,            # "username" | "user_id"
-        "target_display": target_display,      # exactly as the sender entered it
-        "target_username": target_username_norm,  # normalized, username targets only
-        "target_user_id": target_user_id,      # numeric targets only
-        "text": whisper_text,
-        "status": "created",
-        "created_at": now,
-        "expires_at": now + SESSION_TTL_SECONDS,
-        "posted_at": None,
-        "logged": False,
-        # --- media whisper fields (None for text whispers) ---
-        "media": None,            # {"type","file_id","file_unique_id"}
-        "media_caption": None,
-        "view_mode": None,        # set on selection: normal/3s/5s/10s/30s/once
-        "delivery_state": None,   # None | "delivered" | "consumed"
-    }
-    get_sessions(context)[wid] = session
-
-    # Media whisper? Attach the sender's pending media (if any) -> 6 results.
+    # 3) Create unique whisper ID + 4) store whisper data.
     pending = get_pending_media(context).get(str(user.id))
     if pending:
-        session["media"] = {
-            "type": pending["type"],
-            "file_id": pending["file_id"],
-            "file_unique_id": pending["file_unique_id"],
-        }
-        session["media_caption"] = pending.get("caption")
+        session = create_whisper_session(
+            context, user, whisper_text, target_type, target_display,
+            target_username_norm, target_user_id,
+            media={
+                "type": pending["type"],
+                "file_id": pending["file_id"],
+                "file_unique_id": pending["file_unique_id"],
+            },
+            media_caption=pending.get("caption"),
+        )
         logger.info(
             "MEDIA WHISPER CREATED: whisper_id=%s target=%s media=%s",
-            wid, session["target_display"], pending["type"],
+            session["whisper_id"], session["target_display"], pending["type"],
         )
-        results = []
-        for mode in MEDIA_VIEW_MODES:
-            results.append(
-                InlineQueryResultArticle(
-                    id=f"{wid}|{mode}",
-                    title=f"{MEDIA_RESULT_TITLES[mode]} — to {session['target_display']}",
-                    description="Only the target can open it with 🔐",
-                    input_message_content=InputTextMessageContent(
-                        message_text=build_whisper_card(session),
-                        parse_mode=ParseMode.HTML,
-                    ),
-                    reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton(text="🔐", callback_data=f"whisper:{wid}")]]
-                    ),
-                )
+        results = [
+            build_inline_result(
+                session,
+                title=f"{MEDIA_RESULT_TITLES[mode]} — to {session['target_display']}",
+                description="Only the target can open it with 🔐",
+                mode=mode,
             )
-        try:
-            await inline_query.answer(results=results, cache_time=0, is_personal=True)
-        except TelegramError as exc:
-            logger.error("Failed to answer inline query: %s", exc)
-            try:
-                await inline_query.answer(results=[], cache_time=5)
-            except TelegramError:
-                pass
-        return
+            for mode in MEDIA_VIEW_MODES
+        ]
+    else:
+        session = create_whisper_session(
+            context, user, whisper_text, target_type, target_display,
+            target_username_norm, target_user_id,
+        )
+        logger.info(
+            "INLINE WHISPER CREATED: whisper_id=%s target=%s",
+            session["whisper_id"], session["target_display"],
+        )
+        if target_type == "user_id":
+            title = f"🔐 A whisper message to user ID {target_user_id}"
+        else:
+            title = f"🔐 A whisper message to {target_display}"
+        results = [
+            build_inline_result(
+                session,
+                title=title,
+                description="Only they can read the message — tap to post",
+            )
+        ]
 
-    # --- Text whisper (existing flow, unchanged) ------------------------------
-    logger.info(
-        "INLINE WHISPER CREATED: whisper_id=%s target=%s", wid, session["target_display"]
-    )
-
-    # 5) Generate the public whisper card result (sent when the user taps it;
-    #    the actual logging happens in on_chosen_inline_result — the REAL
-    #    creation/success moment, exactly once).
-    result = InlineQueryResultArticle(
-        id=wid,
-        title=f"🔐 A whisper message to {target_display}",
-        description="Only they can read the message — tap to post",
-        input_message_content=InputTextMessageContent(
-            message_text=build_whisper_card(session), parse_mode=ParseMode.HTML
-        ),
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton(text="🔐", callback_data=f"whisper:{wid}")]]
-        ),
-    )
+    # 5) Serve the public whisper card result(s); the actual logging happens in
+    #    on_chosen_inline_result — the REAL creation/success moment, once.
     try:
-        await inline_query.answer(results=[result], cache_time=0, is_personal=True)
+        await inline_query.answer(results=results, cache_time=0, is_personal=True)
     except TelegramError as exc:
         logger.error("Failed to answer inline query: %s", exc)
         try:
@@ -1032,12 +1518,14 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    THE whisper-creation handler (text AND media). Fires exactly when the
-    sender taps an inline result and the public whisper card is posted into
-    the chat.
+    THE whisper-creation handler (text, media, manual AND suggestion paths).
+    Fires exactly when the sender taps an inline result and the public whisper
+    card is posted into the chat.
 
     Result IDs: "<whisper_id>" (text) or "<whisper_id>|<view_mode>" (media).
     The complete whisper log is sent here via send_whisper_log() — exactly once.
+    The recipient is recorded in the sender's private history on every
+    successful use (position updated for repeat recipients).
     """
     chosen = update.chosen_inline_result
     if chosen is None:
@@ -1061,6 +1549,15 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    # SECURITY: inline results only ever reach the user they were served to,
+    # but verify anyway so a manipulated result can never post someone else's
+    # prepared whisper (and never modify a stored recipient identity).
+    if chosen.from_user is None or chosen.from_user.id != session["sender_id"]:
+        logger.warning(
+            "Chosen inline result id=%s selected by non-sender (ignored).", wid
+        )
+        return
+
     logger.info("INLINE WHISPER SELECTED: whisper_id=%s mode=%s", wid, mode or "text")
 
     if session.get("media"):
@@ -1075,7 +1572,11 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
 
     # 6) THE log call — directly in the successful whisper-creation path.
     await send_whisper_log(context, session)
-    # 7) Success — the card is in the chat and the log has been sent (or its
+
+    # Remember/update the recipient in THIS sender's private history
+    # (manual and suggestion-selected recipients alike).
+    remember_recipient(context, chosen.from_user.id, session)
+    # 7) Success — the card is in the chat, the log has been sent (or its
     #    failure was fully printed without breaking the whisper).
 
 
@@ -1339,6 +1840,12 @@ async def post_init(application: Application) -> None:
     except TelegramError as exc:
         logger.warning("Could not register bot commands: %s", exc)
 
+    # Startup state summary for the persistent stores.
+    logger.info(
+        "Persistent state loaded: gmute=%d auth=%d owners=%d history_senders=%d",
+        len(GMUTE_USERS), len(AUTH_USERS), len(OWNER_IDS), len(RECIPIENT_HISTORY),
+    )
+
     # --- Verify the LOG_CHANNEL destination at startup -----------------------
     # A real send is the only way to catch Forbidden / chat-not-found /
     # not-enough-rights. Never silently ignored — but never fatal either:
@@ -1373,11 +1880,27 @@ def build_application() -> Application:
     application.bot_data[USERS_KEY] = {}
     application.bot_data[PENDING_MEDIA_KEY] = {}
 
+    # GMUTE fast-path FIRST: new group messages from globally muted users are
+    # deleted immediately. Returns instantly for everyone else, so normal
+    # group messages are never affected.
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.UpdateType.MESSAGE,
+            on_group_message,
+        )
+    )
+
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("game", cmd_game))
+    # Owner/auth management + global mute (internally permission-checked).
+    application.add_handler(CommandHandler("gmute", cmd_gmute))
+    application.add_handler(CommandHandler("gunmute", cmd_gunmute))
+    application.add_handler(CommandHandler("addauth", cmd_addauth))
+    application.add_handler(CommandHandler("rauth", cmd_rauth))
     application.add_handler(InlineQueryHandler(on_inline_query))
-    # THE whisper-creation path: fires the moment the card is posted -> log.
+    # THE whisper-creation path: fires the moment the card is posted -> log
+    # -> recipient history update.
     application.add_handler(ChosenInlineResultHandler(on_chosen_inline_result))
     application.add_handler(CallbackQueryHandler(on_callback_query, pattern=r"^whisper:"))
     # Media intake (private chat): photo / video / document -> pending media.
@@ -1415,6 +1938,11 @@ def run_bot() -> None:
     log_problem = log_channel_problem()
     if log_problem:
         logger.warning("%s", log_problem)
+    if not OWNER_IDS:
+        logger.warning(
+            "OWNER_IDS is not set — nobody can use /addauth //rauth (and thus "
+            "nobody can manage the global mute list)."
+        )
     if not GAME_URL:
         logger.warning("GAME_URL is not set — /game will say the game is not configured.")
     elif not GAME_URL.lower().startswith("https://"):
