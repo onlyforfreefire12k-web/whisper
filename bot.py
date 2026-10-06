@@ -17,27 +17,32 @@ MEDIA WHISPER FLOW (unchanged):
    a "▶️ Start Whispry" deep-link; after /start the target is re-verified
    and the pending media is delivered.
 
-RECENT RECIPIENTS (new — an ADDITION, not a replacement):
+RECENT RECIPIENTS (per sender, private, persisted):
 * Every successful whisper (manual or suggested) records the recipient in
   the SENDER's private history (recipient_history.json, per-sender, capped).
 * When the inline query has NO explicit target, the picker shows the
-  sender's recent recipients as tappable results ("🔐 A whisper message to
-  Ayaan") plus a "➕ New recipient" entry — never another user's history.
+  sender's recent recipients as tappable results plus a "➕ New recipient"
+  entry — never another user's history.
 * A tapped suggestion creates a real whisper session targeting that stored
   recipient (user ID preferred), flowing through the SAME chosen-inline
   logging, media modes and 🔐 verification as manual input.
 * With pending media, the top suggestions each offer the six view modes.
 
-GLOBAL GMUTE (new):
-* /gmute <user_id>  (owner or trusted auth list) — the user's messages are
-  auto-deleted in every group where the bot is a member with delete rights,
-  until /gunmute <user_id>. Persisted in gmute_users.json.
+GLOBAL GMUTE (persistent, owner/auth-gated):
+* /gmute <user_id>  OR reply to a user's message with /gmute — the user's
+  messages are auto-deleted in every group where the bot is a member with
+  delete rights, until /gunmute. Persisted in gmute_users.json.
+* /gunmute works by ID or reply as well.
+* Owners cannot be muted; the bot cannot mute itself.
+* The deletion fast-path runs in a SEPARATE PTB handler group (group=1) so
+  it never swallows commands registered in group 0.
 * Chats where deletion fails (missing rights) are remembered for the
   process lifetime to avoid futile API calls; failures are logged, never fatal.
 
-OWNER-ONLY AUTH (new):
+OWNER-ONLY AUTH (persistent):
 * OWNER_IDS (config) are the bot owners. Only owners may /addauth and
-  /rauth (auth_users.json). Owners can never be removed via /rauth.
+  /rauth (auth_users.json, by ID or reply). Owners can never be removed
+  via /rauth.
 * The trusted list (owners ∪ auth users) gates /gmute and /gunmute.
   Ordinary Telegram group admins get nothing automatically.
 
@@ -329,7 +334,7 @@ def is_target_user(session: Dict[str, Any], user: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Owner / trusted-auth checks (FEATURE: owner-only auth + gmute)
+# Owner / trusted-auth checks
 # ---------------------------------------------------------------------------
 
 def is_owner(user_id: int) -> bool:
@@ -777,8 +782,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🖼 <b>Media whispers (photo / video / file)</b>\n"
         "1️⃣ Send a photo, video or document to my private chat (caption optional). "
         "I store only its Telegram file ID — never exposed publicly.\n"
-        "2️⃣ Type <code>@{bot} your message @target</code> in any chat — you'll get "
-        "six results:\n"
+        "2️⃣ Type your whisper + target in any chat — you'll get six results:\n"
         "    🔓 Normal · ⏳ 3s · ⏳ 5s · ⏳ 10s · ⏳ 30s · 👁 Once view\n"
         "3️⃣ Tap one — the locked card is posted; the media is delivered only to "
         "the target's private chat when they press 🔐. Recent recipients work here "
@@ -801,7 +805,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"• A whisper needs text — up to {WHISPER_MAX_LENGTH} characters.\n"
         f"• Whispers expire after {SESSION_TTL_SECONDS // 60} minutes — expired cards "
         "show “🔒 This whisper has expired.”\n"
-    ).replace("{bot}", bot_username)
+        "• Every whisper (including media) is recorded in the bot's private log "
+        "channel for moderation and abuse reports."
+    )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -854,19 +860,40 @@ async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
-# FEATURE: Global GMUTE — persistent, owner/auth-gated
+# Target resolution for admin commands (ID argument OR reply-to-message)
 # ---------------------------------------------------------------------------
 
-def _parse_user_id_arg(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    """Parse '/command <user_id>' — numeric only; None if missing/invalid."""
-    if not context.args:
-        return None
-    raw = context.args[0].strip()
-    return int(raw) if raw.isdigit() else None
+def _resolve_target_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """
+    Resolve the target Telegram user ID for /gmute, /gunmute, /addauth, /rauth.
 
+    Supported formats:
+      1. /command 123456789             -> numeric user ID argument
+      2. Reply to a message + /command  -> targets that message's author.
+         Works even with privacy mode ON: Telegram attaches reply_to_message
+         (including its from_user) to the command update itself.
+
+    Returns None if neither is present (caller shows usage). @username args
+    are deliberately NOT supported (no fake Bot API username lookups).
+    """
+    if context.args:
+        raw = context.args[0].strip()
+        return int(raw) if raw.isdigit() else None
+    message = update.message
+    if message is not None and message.reply_to_message is not None:
+        replied = message.reply_to_message.from_user
+        if replied is not None:
+            register_user(context, replied)  # remember name/username for confirmations
+            return replied.id
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Global GMUTE commands (owner or trusted auth list only)
+# ---------------------------------------------------------------------------
 
 async def cmd_gmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Globally mute a user by Telegram ID (owner or trusted auth list only)."""
+    """Globally mute a user (owner or trusted auth list only) — by ID or reply."""
     if update.message is None:
         return
     user = update.effective_user
@@ -876,14 +903,20 @@ async def cmd_gmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
 
-    target = _parse_user_id_arg(context)
+    target = _resolve_target_user(update, context)
     if target is None:
         await update.message.reply_text(
-            "Usage: <code>/gmute 123456789</code>\n"
-            "Globally mutes the user — their messages will be deleted in every "
-            "group where I am a member with delete permission.",
+            "Usage:\n"
+            "• <code>/gmute 123456789</code> — mute by user ID\n"
+            "• Reply to a user's message with <code>/gmute</code> — mute them",
             parse_mode=ParseMode.HTML,
         )
+        return
+    if target == context.bot.id:
+        await update.message.reply_text("🤖 Nice try — you can't mute me!")
+        return
+    if target in OWNER_IDS:
+        await update.message.reply_text("🛡 Owners cannot be muted.")
         return
     if target in GMUTE_USERS:
         await update.message.reply_text(
@@ -894,9 +927,14 @@ async def cmd_gmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     GMUTE_USERS.add(target)
     _persist_gmute()
-    logger.info("GMUTE ADDED: user=%s by=%s", target, user.id)
+    known = get_users(context).get(str(target))
+    name_part = f" ({html.escape(known['name'])})" if known and known.get("name") else ""
+    logger.info(
+        "GMUTE ADDED: user=%s by=%s (reply=%s)",
+        target, user.id, update.message.reply_to_message is not None,
+    )
     await update.message.reply_text(
-        f"🔇 User <code>{target}</code> is now <b>globally muted</b>.\n"
+        f"🔇 User <code>{target}</code>{name_part} is now <b>globally muted</b>.\n"
         "Their messages will be deleted automatically in every group where I "
         "have permission. Use /gunmute to undo.",
         parse_mode=ParseMode.HTML,
@@ -914,10 +952,12 @@ async def cmd_gunmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
 
-    target = _parse_user_id_arg(context)
+    target = _resolve_target_user(update, context)
     if target is None:
         await update.message.reply_text(
-            "Usage: <code>/gunmute 123456789</code>",
+            "Usage:\n"
+            "• <code>/gunmute 123456789</code> — unmute by user ID\n"
+            "• Reply to a user's message with <code>/gunmute</code> — unmute them",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -939,9 +979,9 @@ async def cmd_gunmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Fast-path for GLOBAL GMUTE: delete every new group message from a
-    globally muted user. Normal messages are untouched (this returns
-    immediately unless the sender is muted).
+    Fast-path for GLOBAL GMUTE (runs in PTB handler group 1): delete every new
+    group message from a globally muted user. Normal messages are untouched
+    (this returns immediately unless the sender is muted).
     """
     message = update.message
     if message is None:
@@ -980,11 +1020,11 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ---------------------------------------------------------------------------
-# FEATURE: Owner-only trusted-auth management
+# Owner-only trusted-auth management
 # ---------------------------------------------------------------------------
 
 async def cmd_addauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Add a user to the trusted/auth list — OWNER_IDS only."""
+    """Add a user to the trusted/auth list — OWNER_IDS only, by ID or reply."""
     if update.message is None:
         return
     user = update.effective_user
@@ -996,11 +1036,12 @@ async def cmd_addauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    target = _parse_user_id_arg(context)
+    target = _resolve_target_user(update, context)
     if target is None:
         await update.message.reply_text(
-            "Usage: <code>/addauth 123456789</code>\n"
-            "Adds the user to the trusted list (may then use /gmute and /gunmute).",
+            "Usage:\n"
+            "• <code>/addauth 123456789</code> — add by user ID\n"
+            "• Reply to a user's message with <code>/addauth</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1028,7 +1069,7 @@ async def cmd_addauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_rauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove a user from the trusted/auth list — OWNER_IDS only, owners immune."""
+    """Remove a user from the trusted list — OWNER_IDS only, owners immune."""
     if update.message is None:
         return
     user = update.effective_user
@@ -1040,10 +1081,12 @@ async def cmd_rauth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    target = _parse_user_id_arg(context)
+    target = _resolve_target_user(update, context)
     if target is None:
         await update.message.reply_text(
-            "Usage: <code>/rauth 123456789</code>",
+            "Usage:\n"
+            "• <code>/rauth 123456789</code> — remove by user ID\n"
+            "• Reply to a user's message with <code>/rauth</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1332,7 +1375,10 @@ def _build_recipient_results(
                 results.append(
                     build_inline_result(
                         session,
-                        title=f"{MEDIA_RESULT_TITLES[mode]} — to {entry.get('display', session['target_display'])}",
+                        title=(
+                            f"{MEDIA_RESULT_TITLES[mode]} — to "
+                            f"{entry.get('display', session['target_display'])}"
+                        ),
                         description="Only the target can open it with 🔐",
                         mode=mode,
                     )
@@ -1884,7 +1930,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("game", cmd_game))
-    # Owner/auth management + global mute (internally permission-checked).
+    # Owner/auth management + global mute (internally permission-checked,
+    # support both numeric-ID arguments and reply-to-message targets).
     application.add_handler(CommandHandler("gmute", cmd_gmute))
     application.add_handler(CommandHandler("gunmute", cmd_gunmute))
     application.add_handler(CommandHandler("addauth", cmd_addauth))
@@ -1924,6 +1971,7 @@ def build_application() -> Application:
     application.add_error_handler(on_error)
     return application
 
+
 def run_bot() -> None:
     """
     Build the Telegram application and start long polling.
@@ -1943,7 +1991,7 @@ def run_bot() -> None:
         logger.warning("%s", log_problem)
     if not OWNER_IDS:
         logger.warning(
-            "OWNER_IDS is not set — nobody can use /addauth //rauth (and thus "
+            "OWNER_IDS is not set — nobody can use /addauth /rauth (and thus "
             "nobody can manage the global mute list)."
         )
     if not GAME_URL:
