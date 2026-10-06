@@ -1880,16 +1880,7 @@ def build_application() -> Application:
     application.bot_data[USERS_KEY] = {}
     application.bot_data[PENDING_MEDIA_KEY] = {}
 
-    # GMUTE fast-path FIRST: new group messages from globally muted users are
-    # deleted immediately. Returns instantly for everyone else, so normal
-    # group messages are never affected.
-    application.add_handler(
-        MessageHandler(
-            filters.ChatType.GROUPS & filters.UpdateType.MESSAGE,
-            on_group_message,
-        )
-    )
-
+    # Group 0: normal handlers (commands, inline, callbacks, private messages).
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("game", cmd_game))
@@ -1917,9 +1908,21 @@ def build_application() -> Application:
             on_private_message,
         )
     )
+
+    # Group 1 — GMUTE fast-path (SEPARATE handler group!):
+    # PTB processes each group independently, so this runs for every group
+    # message WITHOUT swallowing commands registered in group 0. Returns
+    # instantly for non-muted users, so normal messages are never affected.
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & filters.UpdateType.MESSAGE,
+            on_group_message,
+        ),
+        group=1,
+    )
+
     application.add_error_handler(on_error)
     return application
-
 
 def run_bot() -> None:
     """
