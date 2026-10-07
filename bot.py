@@ -870,6 +870,15 @@ def reader_media_request(token: str, init_data: str) -> Dict[str, Any]:
         else:
             session["delivery_state"] = "delivered"
         mime, filename = _media_mime_and_name(session["media"])
+        # Reader UI metadata — REQUIRED so the frontend renders the media
+        # correctly (photo <img>, video player, audio player) instead of a
+        # generic download button with "Unknown" sender.
+        media_type = session["media"]["type"]
+        sender = session.get("sender_name") or "Unknown"
+        if session.get("sender_username"):
+            sender += f" (@{session['sender_username']})"
+        caption = build_reader_media_caption(session)
+        expires_in = max(0, int(session.get("expires_at", 0) - time.time()))
 
     logger.info(
         "READER ACCESS GRANTED (media stream): whisper_id=%s mode=%s user=%s",
@@ -882,6 +891,11 @@ def reader_media_request(token: str, init_data: str) -> Dict[str, Any]:
         "data": data,
         "mime": mime,
         "filename": filename,
+        "media_type": media_type,
+        "whisper_id": wid,
+        "sender": sender,
+        "caption": caption,
+        "expires_in": expires_in,
         "remaining": remaining,
         "mode": mode,
         "mode_label": MEDIA_VIEW_LABELS.get(mode, "Normal"),
@@ -1548,7 +1562,7 @@ def create_whisper_session(
     Single session factory (manual + suggestion paths).
     - Resolves username targets to a Telegram user ID when the bot has
       legitimately seen that account (registry) — ID becomes the primary
-      authorization value (point 9).
+      authorization value.
     - Issues the reader access token at creation time (the URL button is
       built into the inline result; tokens die with the whisper).
     """
