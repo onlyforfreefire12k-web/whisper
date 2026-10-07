@@ -1,56 +1,54 @@
 """
-bot.py — Whispry: Inline Whisper Bot with secure MEDIA WHISPERS,
-GLOBAL GMUTE, owner-only auth management, and recent-recipient suggestions.
+bot.py — Whispry: Inline Whisper Bot with secure MEDIA WHISPERS, a Mini App
+LONG-WHISPER READER, GLOBAL GMUTE, owner-only auth, and recent recipients.
 
-TEXT WHISPER FLOW (unchanged):
+TEXT WHISPER CREATION (unchanged):
     @BotName <whisper text> @TargetUsername
     @BotName <whisper text> 123456789
 -> locked text-only card + 🔐 button; verified target only; 15-min TTL.
+Manual text whispers now also offer the six view modes (NORMAL, 3s, 5s, 10s,
+30s, ONCE) so timed/once text whispers work; recent-recipient suggestions
+remain single normal-mode results (previous behavior preserved).
 
-MEDIA WHISPER FLOW (unchanged):
-1. Sender sends a photo/video/document to the bot's PRIVATE chat -> stored as
-   Telegram file_id/file_unique_id ONLY ("pending media").
-2. @BotName <text> <target> returns six results (NORMAL, 3s, 5s, 10s, 30s,
-   ONCE). Public card stays text-only; media is delivered ONLY to the
-   verified target's private chat when they press 🔐.
-3. If the target never started the bot: nothing is revealed; the card gains
-   a "▶️ Start Whispry" deep-link; after /start the target is re-verified
-   and the pending media is delivered.
+MINI APP LONG-WHISPER READER (new):
+* Requires WEBAPP_URL (config). When set, a verified target pressing 🔐 gets
+  a private DM with a real web_app button ("📖 Open Private Reader") that
+  opens /reader on this service — a full-screen, scrollable, dark reader for
+  very long whispers (Telegram popups are no longer used for long texts).
+* SECURITY: the reader page POSTs the short-lived random access token plus
+  Telegram WebApp initData to POST /api/whisper/open. The backend validates
+  initData with Telegram's official HMAC-SHA256 scheme (secret = HMAC
+  ("WebAppData", BOT_TOKEN)), extracts the VERIFIED Telegram user id, and
+  only then checks it against the stored whisper target. Token alone is
+  useless; no whisper id / target id / text is in any URL; the bot token
+  never reaches the frontend.
+* Timed text whispers: the server records the first successful reveal and a
+  consumes_at deadline; the API returns the remaining seconds and refuses
+  content after the deadline (state enforced server-side, not by JS).
+* Once-view text whispers: consumed ATOMICALLY (check-and-set under a lock)
+  on the first successful open; reopening returns "already viewed".
+* Fallbacks: without WEBAPP_URL, or when the DM fails and the text is short,
+  the classic popup reveal is used — existing behavior is never broken.
 
-RECENT RECIPIENTS (per sender, private, persisted):
-* Every successful whisper (manual or suggested) records the recipient in
-  the SENDER's private history (recipient_history.json, per-sender, capped).
-* When the inline query has NO explicit target, the picker shows the
-  sender's recent recipients as tappable results plus a "➕ New recipient"
-  entry — never another user's history.
-* A tapped suggestion creates a real whisper session targeting that stored
-  recipient (user ID preferred), flowing through the SAME chosen-inline
-  logging, media modes and 🔐 verification as manual input.
-* With pending media, the top suggestions each offer the six view modes.
+MEDIA WHISPER FLOW (unchanged): photo/video/document -> pending media ->
+six view-mode results -> 🔐 -> private DM delivery with timers/once states.
+Media never enters the Mini App and is never exposed publicly.
 
-GLOBAL GMUTE (persistent, owner/auth-gated):
-* /gmute <user_id>  OR reply to a user's message with /gmute — the user's
-  messages are auto-deleted in every group where the bot is a member with
-  delete rights, until /gunmute. Persisted in gmute_users.json.
-* /gunmute works by ID or reply as well.
-* Owners cannot be muted; the bot cannot mute itself.
-* The deletion fast-path runs in a SEPARATE PTB handler group (group=1) so
-  it never swallows commands registered in group 0.
-* Chats where deletion fails (missing rights) are remembered for the
-  process lifetime to avoid futile API calls; failures are logged, never fatal.
+RECENT RECIPIENTS (unchanged): per-sender, persisted, private; suggestions
+only when no explicit target is typed; manual @username / numeric-ID
+targeting keeps priority and works exactly as before.
 
-OWNER-ONLY AUTH (persistent):
-* OWNER_IDS (config) are the bot owners. Only owners may /addauth and
-  /rauth (auth_users.json, by ID or reply). Owners can never be removed
-  via /rauth.
-* The trusted list (owners ∪ auth users) gates /gmute and /gunmute.
-  Ordinary Telegram group admins get nothing automatically.
+GLOBAL GMUTE (unchanged): /gmute, /gunmute (owner or trusted list; by ID or
+reply), fast-path deletion in PTB handler group 1, persistent JSON store.
+
+OWNER-ONLY AUTH (unchanged): /addauth, /rauth (owners only; owners immune),
+persisted; trusted list gates /gmute and /gunmute.
 
 Threading model (Render Web Service) — unchanged:
 
     python live.py
         ├── Telegram bot -> daemon background thread (start_bot_thread)
-        └── Flask        -> main thread (live.py)
+        └── Flask        -> main thread (+ /reader Mini App + open API)
 
 Event-loop / signal notes (Python 3.12, background thread) — unchanged:
 the thread's event loop is created explicitly (asyncio.new_event_loop() +
@@ -61,14 +59,19 @@ and close_loop=False (_bot_worker() owns and closes the loop itself).
 """
 
 import asyncio
+import hashlib
+import hmac
 import html
+import json
 import logging
 import re
 import secrets
 import threading
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl
 
 from telegram import (
     BotCommand,
@@ -101,6 +104,7 @@ from config import (
     LOG_CHANNEL_DEST,
     OWNER_IDS,
     SESSION_TTL_SECONDS,
+    WEBAPP_URL,
     WHISPER_MAX_LENGTH,
     log_channel_problem,
 )
@@ -111,11 +115,28 @@ logger = logging.getLogger(__name__)
 # In-memory state (no database required)
 # ---------------------------------------------------------------------------
 
-SESSIONS_KEY = "whisper_sessions"  # whisper_id -> session dict
-USERS_KEY = "user_registry"        # telegram user id (as str) -> profile
-                                   # (bookkeeping only — NOT used for whisper
-                                   #  targets or authorization)
+USERS_KEY = "user_registry"          # telegram user id (as str) -> profile
 PENDING_MEDIA_KEY = "pending_media"  # sender id (as str) -> pending media dict
+
+# Whisper sessions now live at MODULE level (instead of bot_data) so the
+# Flask Mini App API (main thread) can access the same store thread-safely.
+# Bot handlers keep using get_sessions(context) — same dict, same behavior.
+_whisper_lock = threading.RLock()
+WHISPER_SESSIONS: Dict[str, Dict[str, Any]] = {}  # whisper_id -> session dict
+
+# Short-lived reader access tokens: token -> {"wid", "expires_at"}.
+# Cryptographically random, server-side mapping, quick expiry, single whisper,
+# no whisper/target IDs encoded in the token itself.
+WEBAPP_TOKEN_TTL_SECONDS = 120
+_webapp_tokens: Dict[str, Dict[str, Any]] = {}
+
+# How old Telegram initData may be when validated (Telegram recommends
+# checking auth_date; whispers' own 15-min TTL is the tighter bound anyway).
+WEBAPP_INITDATA_MAX_AGE_SECONDS = 86400
+
+# Bot runtime handles used by the Flask thread (set during bot startup).
+_bot_loop: Optional[asyncio.AbstractEventLoop] = None
+_bot_ref: Optional[Any] = None
 
 # answerCallbackQuery text is limited to 200 characters by Telegram.
 CALLBACK_ANSWER_MAX = 200
@@ -273,7 +294,8 @@ def parse_inline_query(raw: str) -> Tuple[Optional[str], Optional[int], str]:
 # ---------------------------------------------------------------------------
 
 def get_sessions(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
-    return context.application.bot_data.setdefault(SESSIONS_KEY, {})
+    """All whisper sessions (module-level store shared with the Flask API)."""
+    return WHISPER_SESSIONS
 
 
 def get_users(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Dict[str, Any]]:
@@ -292,7 +314,7 @@ def register_user(context: ContextTypes.DEFAULT_TYPE, user: Any) -> None:
 
     IMPORTANT: this registry is NOT used for whisper target resolution or
     authorization. Whisper targets are stored exactly as the sender typed
-    them and authorized via the button-press callback (see is_target_user).
+    them and authorized via the button press (see is_target_user).
     """
     if user is None:
         return
@@ -304,15 +326,17 @@ def register_user(context: ContextTypes.DEFAULT_TYPE, user: Any) -> None:
 
 
 def prune_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop whisper sessions past their expiration time."""
+    """Drop whisper sessions and reader tokens past their expiration time."""
     now = time.time()
-    sessions = get_sessions(context)
-    for wid in [wid for wid, s in sessions.items() if now > s.get("expires_at", 0)]:
-        sessions.pop(wid, None)
+    with _whisper_lock:
+        for wid in [wid for wid, s in WHISPER_SESSIONS.items() if now > s.get("expires_at", 0)]:
+            WHISPER_SESSIONS.pop(wid, None)
+        for tk in [t for t, e in _webapp_tokens.items() if now > e["expires_at"]]:
+            _webapp_tokens.pop(tk, None)
 
 
 # ---------------------------------------------------------------------------
-# Whisper authorization — the ONE rule (shared by text AND media whispers)
+# Whisper authorization — the ONE rule (text, media AND the Mini App reader)
 # ---------------------------------------------------------------------------
 
 def is_target_user(session: Dict[str, Any], user: Any) -> bool:
@@ -321,11 +345,10 @@ def is_target_user(session: Dict[str, Any], user: Any) -> bool:
 
       - user_id target: exact Telegram user ID match.
       - username target: normalized comparison against the username Telegram
-        reports for the person pressing the button (learned from the callback
-        query itself — no Bot API lookups, no registry, no /start required).
+        reports (callback presser OR verified initData user — both come from
+        Telegram itself, never from user-typed text).
 
     The sender has NO special status: they pass only if they are the target.
-    Never trust callback message text — only callback_query.from_user.
     """
     if session["target_type"] == "user_id":
         return user.id == session["target_user_id"]
@@ -501,6 +524,11 @@ def build_log_text(session: Dict[str, Any]) -> str:
         )
         if session.get("media_caption"):
             text += f"📎 <b>Media caption:</b>\n{_html_fit(session['media_caption'], 300)}\n\n"
+    elif session.get("view_mode") and session["view_mode"] != "normal":
+        text += (
+            "👁 <b>View mode:</b>\n"
+            f"{MEDIA_VIEW_LABELS.get(session['view_mode'], 'Normal')}\n\n"
+        )
     text += (
         "💬 <b>Whisper:</b>\n"
         f"{html.escape(session['text'])}\n\n"
@@ -651,6 +679,228 @@ async def send_media_log_attachment(
 
 
 # ---------------------------------------------------------------------------
+# MINI APP LONG-WHISPER READER — tokens, initData validation, open API
+# ---------------------------------------------------------------------------
+
+def issue_webapp_token(wid: str) -> str:
+    """
+    Issue a short-lived, cryptographically random reader access token that
+    maps SERVER-SIDE to this whisper. The token contains no whisper/target
+    IDs and is useless without a valid Telegram initData.
+    """
+    now = time.time()
+    with _whisper_lock:
+        for tk in [t for t, e in _webapp_tokens.items() if now > e["expires_at"]]:
+            _webapp_tokens.pop(tk, None)
+        token = secrets.token_urlsafe(32)
+        _webapp_tokens[token] = {"wid": wid, "expires_at": now + WEBAPP_TOKEN_TTL_SECONDS}
+    logger.info(
+        "WEBAPP READER TOKEN ISSUED: whisper_id=%s ttl=%ss", wid, WEBAPP_TOKEN_TTL_SECONDS
+    )
+    return token
+
+
+def validate_webapp_init_data(init_data: str) -> Optional[SimpleNamespace]:
+    """
+    Validate Telegram Mini App initData using the OFFICIAL algorithm:
+
+        secret_key        = HMAC_SHA256(key="WebAppData", message=BOT_TOKEN)
+        data_check_string = all initData fields except 'hash',
+                            sorted alphabetically, joined as 'k=v' with '\\n'
+        calculated_hash   = HMAC_SHA256(key=secret_key, message=data_check_string)
+
+    plus an auth_date freshness check. On success returns a SimpleNamespace
+    (id, username, name) taken from the VERIFIED user object; None otherwise.
+    The identity NEVER comes from URL parameters or client-typed text.
+    """
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    except Exception:
+        return None
+
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calculated = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calculated, received_hash):
+        logger.warning("WEBAPP INITDATA REJECTED: HMAC mismatch.")
+        return None
+
+    try:
+        auth_date = int(pairs.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if auth_date <= 0 or time.time() - auth_date > WEBAPP_INITDATA_MAX_AGE_SECONDS:
+        logger.warning("WEBAPP INITDATA REJECTED: auth_date too old/invalid.")
+        return None
+
+    try:
+        user = json.loads(pairs.get("user", "{}"))
+        uid = int(user["id"])
+    except Exception:
+        logger.warning("WEBAPP INITDATA REJECTED: missing/invalid user payload.")
+        return None
+
+    return SimpleNamespace(
+        id=uid,
+        username=user.get("username"),
+        name=user.get("first_name") or user.get("full_name") or "Unknown",
+    )
+
+
+def open_whisper_via_webapp(token: str, init_data: str) -> Dict[str, Any]:
+    """
+    THE Mini App reader API (called synchronously by the Flask thread).
+
+    Order of checks (all server-side):
+      1. Access token exists and is not expired.
+      2. Telegram initData is cryptographically valid -> VERIFIED user.
+      3. Verified user matches the stored whisper target (is_target_user).
+      4. Whisper not expired (15-minute TTL).
+      5. View-mode state (once/timed/normal) enforced atomically.
+
+    Returns a plain dict; it NEVER includes whisper IDs, target IDs or any
+    data to unauthorized callers.
+    """
+    now = time.time()
+    token = (token or "").strip()
+
+    with _whisper_lock:
+        entry = _webapp_tokens.get(token)
+        if entry is None or now > entry["expires_at"]:
+            _webapp_tokens.pop(token, None)
+            return {"status": "invalid_token"}
+        wid = entry["wid"]
+
+    verified = validate_webapp_init_data(init_data)
+    if verified is None:
+        return {"status": "unauthorized"}
+
+    with _whisper_lock:
+        session = WHISPER_SESSIONS.get(wid)
+        if session is None:
+            return {"status": "whisper_expired"}
+        if now > session.get("expires_at", 0):
+            WHISPER_SESSIONS.pop(wid, None)
+            return {"status": "whisper_expired"}
+
+        # SECURITY: target identity check with the VERIFIED Telegram id only.
+        if not is_target_user(session, verified):
+            logger.info(
+                "WEBAPP READER DENIED: whisper_id=%s user=%s", wid, verified.id
+            )
+            return {"status": "denied"}
+
+        # Media whispers use the existing chat delivery flow, not the reader.
+        if session.get("media"):
+            return {"status": "media"}
+
+        mode = session.get("view_mode") or "normal"
+        state = session.get("delivery_state")
+        remaining: Optional[int] = None
+        first_reveal = not session.get("opened_logged")
+
+        if mode == "once":
+            if state == "consumed":
+                return {"status": "already_viewed"}
+            # ATOMIC check-and-set under the lock — the server enforces once.
+            session["delivery_state"] = "consumed"
+        elif mode in MEDIA_VIEW_DELETE_DELAYS:
+            delay = MEDIA_VIEW_DELETE_DELAYS[mode]
+            if state == "consumed":
+                return {"status": "timed_expired"}
+            if state == "timed":
+                consumes_at = session.get("consumes_at", 0)
+                if now >= consumes_at:
+                    session["delivery_state"] = "consumed"
+                    return {"status": "timed_expired"}
+                remaining = int(consumes_at - now)
+            else:
+                # Timer starts at the FIRST successful authorized reveal.
+                session["revealed_at"] = now
+                session["consumes_at"] = now + delay
+                session["delivery_state"] = "timed"
+                remaining = delay
+        else:  # normal
+            session["delivery_state"] = "delivered"
+
+        if first_reveal:
+            session["opened_logged"] = True
+
+        payload = {
+            "status": "ok",
+            "text": session["text"],
+            "mode": mode,
+            "mode_label": MEDIA_VIEW_LABELS.get(mode, "Normal"),
+            "remaining": remaining,
+            "sender": (
+                (session.get("sender_name") or "Unknown")
+                + (f" (@{session['sender_username']})" if session.get("sender_username") else "")
+            ),
+            "created": format_time(session.get("created_at")),
+        }
+
+    logger.info(
+        "WEBAPP READER OPENED: whisper_id=%s mode=%s user=%s", wid, mode, verified.id
+    )
+    if first_reveal:
+        _notify_opened(session, verified, wid)
+    return payload
+
+
+def _notify_opened(session: Dict[str, Any], verified: Any, wid: str) -> None:
+    """Send a one-time 'WHISPER OPENED' entry to the private log channel.
+
+    The log text is built synchronously in the calling (Flask) thread and the
+    actual send is scheduled on the bot's event loop — never blocks Flask and
+    never contains the whisper text.
+    """
+    if LOG_CHANNEL_DEST is None:
+        return
+    mode_label = MEDIA_VIEW_LABELS.get(session.get("view_mode") or "normal", "Normal")
+    log_text = (
+        "📖 <b>WHISPER OPENED</b>\n\n"
+        f"🆔 Whisper ID: #{html.escape(wid)}\n\n"
+        "👤 <b>Sender:</b>\n"
+        f"Name: {html.escape(session.get('sender_name') or 'Unknown')}\n"
+        f"Username: {_log_username(session.get('sender_username'))}\n"
+        f"ID: <code>{session['sender_id']}</code>\n\n"
+        "🎯 <b>Recipient (verified):</b>\n"
+        f"Name: {html.escape(getattr(verified, 'name', None) or 'Unknown')}\n"
+        f"Username: {_log_username(getattr(verified, 'username', None))}\n"
+        f"ID: <code>{verified.id}</code>\n\n"
+        f"👁 <b>View mode:</b> {mode_label}\n\n"
+        f"🕐 <b>Time:</b> {format_time(time.time())}"
+    )
+    loop = _bot_loop
+    if loop is None or loop.is_closed():
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(_send_opened_log(log_text, wid), loop)
+    except Exception:
+        logger.exception("Could not schedule WHISPER OPENED log for %s", wid)
+
+
+async def _send_opened_log(log_text: str, wid: str) -> None:
+    """Deliver the 'WHISPER OPENED' log text to LOG_CHANNEL (best-effort)."""
+    bot = _bot_ref
+    if bot is None:
+        return
+    try:
+        await bot.send_message(
+            chat_id=LOG_CHANNEL_DEST, text=log_text, parse_mode=ParseMode.HTML
+        )
+        logger.info("WHISPER OPENED LOG SENT: whisper_id=%s", wid)
+    except Exception:
+        logger.exception("WHISPER OPENED LOG FAILED: whisper_id=%s", wid)
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -688,13 +938,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "    🔐 A whisper message to @username.\n"
         "    Only they can read the message.\n\n"
         "4️⃣ Only the target can open it with 🔐 — verified by their Telegram "
-        "account (user ID, or their current @username). Everyone else — "
-        "including the sender — sees “❌ This whisper isn't for you.”\n\n"
+        "account. Everyone else — including the sender — sees “❌ This whisper "
+        "isn't for you.”\n\n"
+        "📖 <b>Private reader</b> — long whispers open in a full-screen, "
+        "scrollable Whispry reader (Mini App) that only the verified target "
+        "can unlock.\n\n"
         "🕐 <b>Recent recipients</b> — after you've whispered to someone, they "
         "appear as tappable suggestions whenever you don't type a target.\n\n"
         "🖼 <b>Media whispers</b> — send a photo, video or file to my private "
         "chat first, then whisper as usual (see /help).\n\n"
-        "ℹ️ The whisper text is never shown in the chat.\n\n"
         "Type /help for details, or /game to play. 🎮"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -779,6 +1031,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• The target does NOT need to have started the bot — the whisper card is "
         "posted in the chat and they unlock it with the 🔐 button.\n"
         "• The whisper text is never shown in the chat.\n\n"
+        "📖 <b>Reading a whisper (private reader)</b>\n"
+        "• Press 🔐 on the card — you'll get a private message with an "
+        "“Open Private Reader” button.\n"
+        "• The reader is a full-screen, scrollable Mini App — perfect for very "
+        "long whispers.\n"
+        "• It verifies your Telegram identity on the server before showing "
+        "anything; nobody else can open your whisper.\n"
+        "• Text whispers support view modes too: 🔓 Normal, ⏳ 3s/5s/10s/30s "
+        "(auto-locks after the countdown) and 👁 Once view.\n\n"
         "🖼 <b>Media whispers (photo / video / file)</b>\n"
         "1️⃣ Send a photo, video or document to my private chat (caption optional). "
         "I store only its Telegram file ID — never exposed publicly.\n"
@@ -791,22 +1052,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "can be opened only once.\n"
         "• If the target hasn't started me yet, they'll get a ▶️ Start Whispry "
         "button — after starting, the media is delivered to them.\n\n"
-        "🔓 <b>Opening a whisper</b>\n"
-        "• Press the 🔐 button on the card.\n"
-        "• Numeric-ID whispers open only for that exact Telegram user ID.\n"
-        "• @username whispers open only for the Telegram account currently using "
-        "that username — if the target changes their username, the whisper can no "
-        "longer be opened (user IDs are immune to that).\n"
-        "• Short text whispers open as a private popup; long ones are sent to the "
-        "target's private chat.\n\n"
         "🎮 <b>Game</b>\n"
         "• Send /game to open the mini app game right inside Telegram.\n\n"
         "ℹ️ <b>Good to know</b>\n"
         f"• A whisper needs text — up to {WHISPER_MAX_LENGTH} characters.\n"
         f"• Whispers expire after {SESSION_TTL_SECONDS // 60} minutes — expired cards "
         "show “🔒 This whisper has expired.”\n"
-        "• Every whisper (including media) is recorded in the bot's private log "
-        "channel for moderation and abuse reports."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -1297,7 +1548,10 @@ def create_whisper_session(
         "media": media,           # {"type","file_id","file_unique_id"} or None
         "media_caption": media_caption,
         "view_mode": None,        # set on selection: normal/3s/5s/10s/30s/once
-        "delivery_state": None,   # None | "delivered" | "consumed"
+        "delivery_state": None,   # None | "delivered" | "timed" | "consumed"
+        "revealed_at": None,      # timed text whispers: first authorized reveal
+        "consumes_at": None,      # timed text whispers: lock deadline (server)
+        "opened_logged": False,   # one-time WHISPER OPENED log flag
     }
     get_sessions(context)[wid] = session
     return session
@@ -1312,7 +1566,7 @@ def build_inline_result(
     """
     The single inline-result factory: secure text-only card + 🔐 button whose
     callback_data contains ONLY the whisper ID ("whisper:W-XXXXXX"). The mode
-    is encoded in the result id ("<wid>|<mode>") for media view-mode choices.
+    is encoded in the result id ("<wid>|<mode>") for view-mode choices.
     """
     rid = f"{session['whisper_id']}|{mode}" if mode else session["whisper_id"]
     return InlineQueryResultArticle(
@@ -1339,6 +1593,9 @@ def _build_recipient_results(
     logging, media modes, 🔐 verification) unchanged. Result ids reference
     only sessions we just created for this user — nothing user-controlled is
     ever trusted as the recipient identity.
+
+    Text suggestions remain single normal-mode results (existing behavior);
+    with pending media the six view modes are offered per recipient.
 
     Returns None when the sender has no history (caller falls back to the
     format hint).
@@ -1538,16 +1795,17 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "INLINE WHISPER CREATED: whisper_id=%s target=%s",
             session["whisper_id"], session["target_display"],
         )
-        if target_type == "user_id":
-            title = f"🔐 A whisper message to user ID {target_user_id}"
-        else:
-            title = f"🔐 A whisper message to {target_display}"
+        # Text whispers support the same view modes via the Mini App reader
+        # (Normal / 3s / 5s / 10s / 30s / Once). The public card is identical
+        # for every mode — modes only affect the PRIVATE reading experience.
         results = [
             build_inline_result(
                 session,
-                title=title,
+                title=f"{MEDIA_RESULT_TITLES[mode]} — to {session['target_display']}",
                 description="Only they can read the message — tap to post",
+                mode=mode,
             )
+            for mode in MEDIA_VIEW_MODES
         ]
 
     # 5) Serve the public whisper card result(s); the actual logging happens in
@@ -1568,7 +1826,7 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
     Fires exactly when the sender taps an inline result and the public whisper
     card is posted into the chat.
 
-    Result IDs: "<whisper_id>" (text) or "<whisper_id>|<view_mode>" (media).
+    Result IDs: "<whisper_id>" (text suggestion) or "<whisper_id>|<view_mode>".
     The complete whisper log is sent here via send_whisper_log() — exactly once.
     The recipient is recorded in the sender's private history on every
     successful use (position updated for repeat recipients).
@@ -1610,6 +1868,9 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
         session["view_mode"] = mode or "normal"
         # Consume the pending media so it is not attached to future whispers.
         get_pending_media(context).pop(str(chosen.from_user.id), None)
+    elif mode is not None:
+        # Text whisper with an explicit view mode (reader-enforced later).
+        session["view_mode"] = mode
 
     if session.get("posted_at") is None:
         session["status"] = "posted"
@@ -1627,7 +1888,7 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
 
 
 # ---------------------------------------------------------------------------
-# 🔐 Read button — verified, private reveal (text) / delivery (media)
+# 🔐 Read button — verified reveal: Mini App reader (text) / DM delivery (media)
 # ---------------------------------------------------------------------------
 
 async def _safe_answer(query: CallbackQuery, text: str, alert: bool = True) -> None:
@@ -1641,7 +1902,11 @@ async def _safe_answer(query: CallbackQuery, text: str, alert: bool = True) -> N
 async def reveal_whisper(
     query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]
 ) -> None:
-    """Reveal the TEXT whisper only to the already-verified presser (unchanged)."""
+    """
+    CLASSIC reveal (fallback when the Mini App reader is disabled/unavailable):
+    ephemeral popup for short whispers, private DM for long ones. Preserved
+    exactly as before so existing behavior never regresses.
+    """
     text = session["text"]
 
     # Preferred: ephemeral popup. Telegram shows callback answers (with
@@ -1679,6 +1944,83 @@ async def reveal_whisper(
         )
         # Last resort: truncated popup — still visible only to the presser.
         await _safe_answer(query, text[: CALLBACK_ANSWER_MAX - 1] + "…")
+
+
+async def open_text_reader(
+    query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, session: Dict[str, Any]
+) -> None:
+    """
+    MINI APP reader flow for verified TEXT targets.
+
+    The 🔐 press was already verified (is_target_user). We issue a short-lived
+    random access token and DM the verified presser a private message with a
+    REAL web_app button ("📖 Open Private Reader") — web_app buttons work in
+    private bot chats (they are NOT permitted on inline messages, which is why
+    the reader is delivered here instead of attached to the card).
+
+    Fallbacks preserve existing behavior:
+      - WEBAPP_URL not configured -> classic popup/DM reveal (reveal_whisper).
+      - DM fails (never started) + short text -> classic popup reveal.
+      - DM fails + long text -> "Start Whispry first" instruction (no reveal).
+    """
+    text = session["text"]
+
+    if not WEBAPP_URL:
+        await reveal_whisper(query, context, session)
+        return
+
+    token = issue_webapp_token(session["whisper_id"])
+    reader_url = WEBAPP_URL.rstrip("/") + "/reader?t=" + token
+
+    dm_text = (
+        "🤫 <b>Whisper unlocked!</b>\n\n"
+        "Tap the button below to read it in your private Whispry reader — "
+        "full screen, scrollable, just for you.\n\n"
+        "⏳ <i>This button is valid for a short time. If it expires, press 🔐 on "
+        "the whisper card again.</i>"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text="📖 Open Private Reader", web_app=WebAppInfo(url=reader_url))]]
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=dm_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+        )
+    except Forbidden:
+        # Verified target never started the bot -> DM impossible.
+        if len(text) <= CALLBACK_ANSWER_MAX:
+            try:
+                await query.answer(text=text, show_alert=True)
+                return
+            except TelegramError:
+                pass
+        await _safe_answer(
+            query,
+            "📩 Start Whispry first (open my chat and press Start), then press 🔐 "
+            "again to read this whisper privately.",
+        )
+        return
+    except TelegramError as exc:
+        logger.warning(
+            "Reader DM failed for whisper %s: %s", session["whisper_id"], exc
+        )
+        if len(text) <= CALLBACK_ANSWER_MAX:
+            try:
+                await query.answer(text=text, show_alert=True)
+                return
+            except TelegramError:
+                pass
+        await _safe_answer(
+            query, "⚠️ Could not open the reader right now — press 🔐 again in a moment."
+        )
+        return
+
+    await _safe_answer(
+        query, "📖 Check my private message — tap “Open Private Reader”.", alert=False
+    )
 
 
 async def offer_start_whispry(
@@ -1841,7 +2183,7 @@ async def on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await deliver_media_whisper(query, context, session)
         return
 
-    await reveal_whisper(query, context, session)
+    await open_text_reader(query, context, session)
 
 
 # ---------------------------------------------------------------------------
@@ -1874,6 +2216,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(application: Application) -> None:
     """Runs once after the bot is initialized, before polling starts."""
+    global _bot_ref
+    _bot_ref = application.bot  # used by the Flask thread for async log sends
+
     try:
         await application.bot.set_my_commands(
             [
@@ -1891,6 +2236,12 @@ async def post_init(application: Application) -> None:
         "Persistent state loaded: gmute=%d auth=%d owners=%d history_senders=%d",
         len(GMUTE_USERS), len(AUTH_USERS), len(OWNER_IDS), len(RECIPIENT_HISTORY),
     )
+    if WEBAPP_URL:
+        logger.info("Mini App whisper reader ENABLED: %s/reader", WEBAPP_URL.rstrip("/"))
+    else:
+        logger.info(
+            "WEBAPP_URL not set — text whispers use the classic popup/DM reveal."
+        )
 
     # --- Verify the LOG_CHANNEL destination at startup -----------------------
     # A real send is the only way to catch Forbidden / chat-not-found /
@@ -1922,7 +2273,6 @@ async def post_init(application: Application) -> None:
 def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    application.bot_data[SESSIONS_KEY] = {}
     application.bot_data[USERS_KEY] = {}
     application.bot_data[PENDING_MEDIA_KEY] = {}
 
@@ -2033,10 +2383,11 @@ def _bot_worker() -> None:
     non-main threads, so we explicitly create and install one here BEFORE
     starting the bot, and close it again when the bot stops.
     """
-    global _bot_error
+    global _bot_error, _bot_loop
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    _bot_loop = loop  # used by the Flask thread for scheduled log sends
     try:
         run_bot()
     except Exception as exc:
@@ -2044,6 +2395,7 @@ def _bot_worker() -> None:
         _bot_error = f"{type(exc).__name__}: {exc}"
         logger.exception("Telegram bot thread crashed!")
     finally:
+        _bot_loop = None
         try:
             # Give pending async generators a chance to finalize, then close.
             loop.run_until_complete(loop.shutdown_asyncgens())
@@ -2064,7 +2416,7 @@ def start_bot_thread() -> threading.Thread:
         python live.py
             ├── Telegram bot  -> background thread (own asyncio event loop,
             │                    run_polling(stop_signals=None))
-            └── Flask         -> main thread
+            └── Flask         -> main thread (+ /reader Mini App + open API)
 
     Exactly one thread, one Application, one run_polling() call.
     """
