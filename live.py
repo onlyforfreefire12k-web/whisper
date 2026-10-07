@@ -342,15 +342,18 @@ footer{padding:12px;text-align:center;color:var(--muted);font-size:12px;border-t
     fromEl.textContent=meta.sender||'Unknown';
     modeEl.textContent=meta.mode_label||'Normal';
     contentEl.innerHTML='';
-    var type=meta.media_type||'document';
+    var type=meta.media_type||'';
+    var mime=(meta.mime||'').toLowerCase();
     var url=objectUrlFor(meta.mime||'application/octet-stream',d.blob);
-    if(type==='photo'){
+    // Render by declared type, with a mime-based fallback so a photo can
+    // never fall through to a plain download button again.
+    if(type==='photo'||mime.indexOf('image/')===0){
       var img=document.createElement('img'); img.src=url; img.alt='Private whisper photo';
       contentEl.appendChild(img);
-    } else if(type==='video'){
+    } else if(type==='video'||mime.indexOf('video/')===0){
       var v=document.createElement('video'); v.src=url; v.controls=true; v.playsInline=true;
       contentEl.appendChild(v);
-    } else if(type==='audio'){
+    } else if(type==='audio'||mime.indexOf('audio/')===0){
       var a=document.createElement('audio'); a.src=url; a.controls=true;
       contentEl.appendChild(a);
     } else {
@@ -373,7 +376,7 @@ footer{padding:12px;text-align:center;color:var(--muted);font-size:12px;border-t
     post('/api/whisper/deliver').then(function(r){
       var s=r.json?r.json.status:'error';
       if(s==='ok'){ setState('📩','Delivered','Check your Telegram chat — the file was sent to you directly.'); }
-      else if(s==='need_start'){ setState('📩','Start Whispry first','Open @'+(window.location.hostname? 'the bot':'bot')+' in Telegram, press Start once, then tap Receive again.'); }
+      else if(s==='need_start'){ setState('📩','Start Whispry first','Open the bot in Telegram, press Start once, then tap Receive again.'); }
       else { handle(r.json||{status:s}); }
     }).catch(function(){ setState('⚠️','Connection Error','Could not reach the Whispry server.'); });
   }
