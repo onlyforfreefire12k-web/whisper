@@ -114,6 +114,19 @@ def log_channel_problem() -> Optional[str]:
 # Set on Render as an environment variable — never hardcoded.
 GAME_URL = os.getenv("GAME_URL", "").strip()
 
+# --- Private Whisper Reader (Mini App / WebView) -----------------------------------
+# Base URL of THIS Render service (e.g. https://whispry.onrender.com). When set,
+# verified recipients get a "📖 Open Private Reader" web_app button that opens a
+# full-screen, scrollable, dark reader for long whispers. The reader is served
+# by the same service at /reader and validates Telegram initData server-side.
+#
+# If left empty, the Mini App reader is DISABLED and text whispers fall back to
+# the classic popup/private-DM reveal (existing behavior, nothing breaks).
+#
+#   WEBAPP_URL=https://whispry.onrender.com
+#
+WEBAPP_URL: str = os.getenv("WEBAPP_URL", "").strip()
+
 # --- Tuning ------------------------------------------------------------------------
 
 # Port for the Flask health server (Render injects PORT automatically).
