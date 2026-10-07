@@ -1,12 +1,7 @@
 """
-config.py — Central configuration for the Inline Whisper Bot.
+config.py — Central configuration for the Whispry bot.
 
-All secrets come from environment variables (see README.md). Nothing secret
-is hardcoded in this repository.
-
-Local development: put your variables in a `.env` file in the project root.
-It is loaded automatically if python-dotenv is installed. Real environment
-variables (e.g. set on the Render dashboard) ALWAYS take priority.
+All secrets come from environment variables. Nothing secret is hardcoded.
 """
 
 import os
@@ -19,21 +14,15 @@ try:
 
     load_dotenv(Path(__file__).resolve().parent / ".env")
 except ImportError:
-    # python-dotenv not installed — plain environment variables still work.
     pass
 
 # --- Required -------------------------------------------------------------------
 
-# Bot token from @BotFather. Required for the Telegram bot to run.
+# Bot token from @BotFather.
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 
 # --- Owners (owner-only auth management) ------------------------------------------
-# Comma- or space-separated Telegram user IDs that OWN the bot. Owners are the
-# only ones who may manage the trusted auth list via /addauth and /rauth.
-# Owners always keep owner rights and can never be removed with /rauth.
-#
 #   OWNER_IDS=123456789,987654321
-#
 OWNER_IDS: list = []
 for _part in os.getenv("OWNER_IDS", "").replace(";", ",").replace(" ", ",").split(","):
     _part = _part.strip()
@@ -41,20 +30,10 @@ for _part in os.getenv("OWNER_IDS", "").replace(";", ",").replace(" ", ",").spli
         OWNER_IDS.append(int(_part))
 
 # --- Log channel destination ------------------------------------------------------
-# LOG_CHANNEL is THE destination for whisper logs. It accepts:
-#
-#   @MyWhisperLogs        -> public channel username (preferred)
-#   MyWhisperLogs         -> same as above (the @ is added automatically)
-#   -1001234567890        -> numeric chat/channel ID
-#
-# IMPORTANT: an invite link such as https://t.me/+xxxxxxxx is NOT a send
-# destination and CANNOT be passed to send_message(). If one is configured,
-# the bot reports a clear configuration error at startup (see
-# log_channel_problem()).
+#   @MyWhisperLogs  |  MyWhisperLogs  |  -1001234567890
+# Invite links (https://t.me/+xxxx) are NOT send destinations and are rejected.
 LOG_CHANNEL: str = os.getenv("LOG_CHANNEL", "").strip()
 
-# Legacy fallback: if LOG_CHANNEL is not set, a numeric LOG_CHANNEL_ID is used
-# (kept for backward compatibility with earlier deployments).
 try:
     LOG_CHANNEL_ID: int = int(os.getenv("LOG_CHANNEL_ID", "0").strip() or "0")
 except ValueError:
@@ -62,24 +41,16 @@ except ValueError:
 
 
 def _resolve_log_destination() -> Tuple[Optional[Union[str, int]], Optional[Tuple[str, str]]]:
-    """
-    Turn LOG_CHANNEL / LOG_CHANNEL_ID into a Telegram send_message destination.
-
-    Returns (destination, None) on success, or (None, (problem_kind, raw_value))
-    when the configuration cannot be used.
-    """
     raw = LOG_CHANNEL
     if raw:
         low = raw.lower()
         if low.startswith(("https://t.me/", "http://t.me/", "t.me/")):
-            # Invite links are NOT send destinations — reject loudly.
             return None, ("invite-link", raw)
         if raw.startswith("@"):
             return raw, None
         if raw.lstrip("-").isdigit():
             return int(raw), None
         if raw.replace("_", "").isalnum():
-            # Bare public username without the leading @.
             return "@" + raw, None
         return None, ("invalid", raw)
     if LOG_CHANNEL_ID:
@@ -91,7 +62,6 @@ LOG_CHANNEL_DEST, _LOG_CHANNEL_PROBLEM = _resolve_log_destination()
 
 
 def log_channel_problem() -> Optional[str]:
-    """Human-readable reason why LOG_CHANNEL is unusable (None = configured OK)."""
     if _LOG_CHANNEL_PROBLEM is None:
         return None
     kind, value = _LOG_CHANNEL_PROBLEM
@@ -110,40 +80,51 @@ def log_channel_problem() -> Optional[str]:
 
 # --- Game (Telegram Mini App / Web App) ------------------------------------------
 
-# HTTPS URL of the game opened by the /game command's Mini App button.
-# Set on Render as an environment variable — never hardcoded.
 GAME_URL = os.getenv("GAME_URL", "").strip()
 
-# --- Private Whisper Reader (Mini App / WebView) -----------------------------------
-# Base URL of THIS Render service (e.g. https://whispry.onrender.com). When set,
-# verified recipients get a "📖 Open Private Reader" web_app button that opens a
-# full-screen, scrollable, dark reader for long whispers. The reader is served
-# by the same service at /reader and validates Telegram initData server-side.
+# --- Private Whisper Reader (Direct-Link Mini App) ---------------------------------
+# The reader opens DIRECTLY from the group card button (no DM, no /start).
 #
-# If left empty, the Mini App reader is DISABLED and text whispers fall back to
-# the classic popup/private-DM reveal (existing behavior, nothing breaks).
+# SETUP (one time):
+#   1. BotFather -> /newapp -> attach -> Web App URL:
+#        https://<your-service>.onrender.com/reader
+#   2. Choose an app short name (e.g. "whisper").
+#   3. Set the env var below to that short name.
 #
-#   WEBAPP_URL=https://whispry.onrender.com
+# The bot then builds buttons as:
+#   https://t.me/<bot_username>/<READER_APP_SHORT_NAME>?startapp=<token>
 #
+# Direct-Link Mini Apps receive SIGNED Telegram initData (verified identity)
+# and work even for users who never pressed Start — exactly what the reader
+# needs. Without this value the reader is DISABLED and no whisper content is
+# ever revealed (a startup error explains the setup).
+READER_APP_SHORT_NAME: str = os.getenv("READER_APP_SHORT_NAME", "").strip()
+
+# DEPRECATED: previously used for a DM-based reader. Kept only so existing
+# environments don't break; it is no longer required by any feature.
 WEBAPP_URL: str = os.getenv("WEBAPP_URL", "").strip()
 
 # --- Tuning ------------------------------------------------------------------------
 
-# Port for the Flask health server (Render injects PORT automatically).
 try:
     PORT: int = int(os.getenv("PORT", "10000"))
 except ValueError:
     PORT = 10000
 
-# Maximum length of a single whisper text.
-WHISPER_MAX_LENGTH: int = 1000
+# Maximum whisper text length. Telegram caps private-chat messages at 4096
+# chars, so long whispers are created by sending the text to the bot's PM
+# first (inline query typing itself is capped at 256 chars by Telegram).
+WHISPER_MAX_LENGTH: int = 4000
 
 # How long (seconds) a whisper stays readable before it expires (15 minutes).
 SESSION_TTL_SECONDS: int = 900
 
+# Private-chat texts longer than this become "pending long text" for the
+# sender's next whisper (inline queries cannot carry this much text).
+LONG_TEXT_PENDING_THRESHOLD: int = 200
+
 
 def config_warnings() -> list:
-    """Human-readable configuration problems, for startup logging."""
     warnings = []
     if not BOT_TOKEN:
         warnings.append(
